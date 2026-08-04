@@ -20,6 +20,8 @@ those locations and file formats.
 ├── skills/             # user-level skills
 ├── prompts/            # user-level prompt templates
 ├── themes/             # user-level TUI themes
+├── SYSTEM.md           # optional replacement system-prompt base
+├── APPEND_SYSTEM.md    # optional appended system-prompt instructions
 ├── AGENTS.md           # global project instructions
 └── logs/               # diagnostics
 ```
@@ -30,6 +32,36 @@ Tau also reads user-level `.agents` resources: `~/.agents/skills/`,
 Startup update checks cache their latest PyPI result in
 `~/.tau/cache/update-check.json` and refresh at most once per day. Set
 `TAU_NO_UPDATE_CHECK=1` to disable the check; Tau also skips it when `CI` is set.
+
+## System prompt files
+
+Tau can replace or extend its generated system prompt with Tau-native Markdown
+files:
+
+```text
+~/.tau/SYSTEM.md                 # user replacement
+~/.tau/APPEND_SYSTEM.md          # user append
+<project>/.tau/SYSTEM.md         # project replacement
+<project>/.tau/APPEND_SYSTEM.md  # project append
+```
+
+For each kind, precedence is explicit CLI input, then the project file, then the
+user file. A higher-precedence append file replaces the lower-precedence append
+file; Tau does not concatenate project and user files. Replacement content still
+receives the selected append text, project instructions, eligible skills, the
+current date, and the working directory. Empty files are valid explicit values.
+
+Run `/reload` after adding, changing, or removing a file. Tau rebuilds the prompt
+for the next model request without adding it to session history. `/session`
+resource diagnostics identify selected, shadowed, or CLI-overridden files. A
+selected file that cannot be inspected or decoded as UTF-8 stops startup or
+reload rather than silently falling back.
+
+System prompt files are Tau-specific and are not discovered from `.agents`.
+Project files currently load automatically, like Tau's other project instruction
+resources. Inspect a repository's `.tau/SYSTEM.md` and `.tau/APPEND_SYSTEM.md`
+before starting Tau there: they can replace or extend the model's highest-priority
+instructions.
 
 ## Network proxies
 
@@ -104,6 +136,12 @@ metadata fields—including the complete `cost_tiers` array—replace the built-
 value. A model's `compat` wins over the provider's, so a built-in per-model value
 overrides a provider-level overlay — override at the model level to change it.
 
+`removed_models` is an additive provider-scoped tombstone list. Tau applies it
+last and removes matching model-list, metadata, context-window, thinking, and
+default references after merging. Bundled tombstones therefore prevent stale
+user overlays from restoring models that Tau previously advertised for the wrong
+provider. They do not affect the same model ID on another provider.
+
 ### Anthropic prompt-cache compat keys
 
 Providers using the `anthropic-messages` API accept three `compat` booleans
@@ -163,6 +201,7 @@ Provider preferences live in `~/.tau/providers.json`:
 
 ```json
 {
+  "schema_version": 2,
   "default_provider": "local-gateway",
   "provider_preferences": {
     "local-gateway": {
@@ -201,12 +240,18 @@ Provider preferences live in `~/.tau/providers.json`:
   custom or local model names to `models` before using them as defaults,
   CLI/TUI selections, or scoped models.
 - `scoped_models` are favorites for the **Ctrl+P** quick-cycle.
-- Older `providers.json` files that contain full `providers` entries are still
-  accepted for compatibility. Tau ignores unrecognized top-level settings and
-  provider-preference fields so files written by newer Tau versions do not block
-  older versions from starting. Recognized fields remain strictly validated.
-  When Tau saves settings again, provider definitions are moved to
-  `~/.tau/catalog.toml` and `providers.json` is rewritten as runtime preferences.
+- `providers.json` uses `schema_version: 2` and stores preferences only. Provider
+  capabilities—model lists, context windows, transports, metadata, and thinking
+  support—always come from the current effective catalog.
+- Older `providers.json` files that contain full `providers` entries are migrated
+  automatically on first load. Tau keeps the original as `providers.json.bak`,
+  moves custom provider definitions to `~/.tau/catalog.toml`, and rewrites
+  built-in providers from the current catalog while preserving safe preferences.
+  This prevents old model or thinking metadata from hiding capabilities added by
+  a Tau upgrade.
+- Tau ignores unrecognized preference fields for cross-version compatibility,
+  but rejects an unsupported `schema_version` rather than risking a destructive
+  rewrite with the wrong format.
 - Custom models declare thinking support in `catalog.toml` with
   `thinking_levels`, `thinking_default`, `thinking_models`, and
   `thinking_parameter` (`"reasoning_effort"`, `"reasoning.effort"`, or
