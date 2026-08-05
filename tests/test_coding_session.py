@@ -1861,6 +1861,7 @@ async def test_session_builds_system_prompt_when_system_is_omitted(tmp_path: Pat
         model="fake",
         storage=storage,
         cwd=tmp_path,
+        trust_default="always",
         resource_paths=TauResourcePaths(root=resource_root, agents_root=None),
     )
     session = await CodingSession.load(config)
@@ -2214,6 +2215,7 @@ async def test_session_skills_disabled_suppresses_skill_index(tmp_path: Path) ->
         model="fake",
         storage=storage,
         cwd=tmp_path,
+        trust_default="always",
         skills_enabled=False,
         resource_paths=TauResourcePaths(root=resource_root, agents_root=None),
     )
@@ -2485,6 +2487,7 @@ async def test_session_loads_tau_native_system_prompt_files(tmp_path: Path) -> N
             model="fake",
             storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
             cwd=tmp_path,
+            trust_default="always",
             resource_paths=TauResourcePaths(root=tau_home, agents_root=None),
         )
     )
@@ -2542,6 +2545,7 @@ async def test_session_reload_tracks_system_prompt_file_precedence(tmp_path: Pat
             model="fake",
             storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
             cwd=tmp_path,
+            trust_default="always",
             resource_paths=TauResourcePaths(root=tau_home, agents_root=None),
         )
     )
@@ -2655,6 +2659,7 @@ async def test_session_reload_refreshes_resources_and_system_prompt(tmp_path: Pa
             model="fake",
             storage=storage,
             cwd=tmp_path,
+            trust_default="always",
             resource_paths=TauResourcePaths(root=resource_root, agents_root=None),
         )
     )
@@ -3418,7 +3423,9 @@ async def test_session_resume_preserves_shell_command_prefix(tmp_path: Path) -> 
 @pytest.mark.anyio
 async def test_session_resumes_indexed_session(tmp_path: Path) -> None:
     manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
-    first_record = manager.create_session(cwd=tmp_path / "first", model="fake", title="First")
+    first_cwd = tmp_path / "first"
+    first_cwd.mkdir()
+    first_record = manager.create_session(cwd=first_cwd, model="fake", title="First")
     second_cwd = tmp_path / "second"
     second_cwd.mkdir(parents=True)
     second_record = manager.create_session(cwd=second_cwd, model="fake", title="Second")
@@ -4009,8 +4016,10 @@ async def test_session_resume_uses_target_session_provider_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    first_cwd = tmp_path / "first"
+    first_cwd.mkdir()
     first_record = manager.create_session(
-        cwd=tmp_path / "first",
+        cwd=first_cwd,
         model="gpt-5",
         provider_name="openai",
         title="First",
@@ -4085,8 +4094,10 @@ async def test_session_resume_missing_provider_preserves_active_provider_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    first_cwd = tmp_path / "first"
+    first_cwd.mkdir()
     first_record = manager.create_session(
-        cwd=tmp_path / "first",
+        cwd=first_cwd,
         model="gpt-5",
         provider_name="openai",
         title="First",
@@ -4161,8 +4172,10 @@ async def test_session_resume_rejects_incompatible_provider_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    first_cwd = tmp_path / "first"
+    first_cwd.mkdir()
     first_record = manager.create_session(
-        cwd=tmp_path / "first",
+        cwd=first_cwd,
         model="gpt-5",
         provider_name="openai",
         title="First",
@@ -4232,7 +4245,9 @@ async def test_session_resume_rejects_incompatible_provider_model(
 @pytest.mark.anyio
 async def test_session_context_usage_recalculates_after_resume(tmp_path: Path) -> None:
     manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
-    first_record = manager.create_session(cwd=tmp_path / "first", model="fake", title="First")
+    first_cwd = tmp_path / "first"
+    first_cwd.mkdir()
+    first_record = manager.create_session(cwd=first_cwd, model="fake", title="First")
     second_cwd = tmp_path / "second"
     second_cwd.mkdir(parents=True)
     second_record = manager.create_session(cwd=second_cwd, model="fake", title="Second")

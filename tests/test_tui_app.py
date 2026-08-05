@@ -202,6 +202,8 @@ class FakeSession:
             input_tokens=1_200_000,
             output_tokens=48_000,
             cached_input_tokens=1_140_000,
+            latest_prompt_tokens=1_200_000,
+            latest_cached_input_tokens=1_188_000,
             estimated_cost=1.24,
         )
         self.system_prompt = "You are Tau."
@@ -501,9 +503,10 @@ def test_session_sidebar_renders_session_metadata() -> None:
     assert "location" not in output
     assert "branch" not in output
     assert "14 turns, 23 tool calls" in output
-    assert "cumulative usage" in output
-    assert "1.2m in, 48k out" in output
-    assert "1.2m in, 48k out · 95% cached · ~$1.24" in output
+    assert "usage" in output
+    assert "cumulative usage" not in output
+    assert "1.2m in, 48k out · ~$1.24" in output
+    assert "cache: 99% latest · 95% session" in output
     assert "auto at 200k" in output
     assert "read, write, edit, bash" in output
     assert "• review" in output
@@ -645,6 +648,23 @@ def test_session_sidebar_omits_cache_rate_for_providers_without_caching() -> Non
     output = console.export_text()
     assert "cached" not in output
     assert "1.2k in, 300 out" in output
+
+
+def test_session_sidebar_shows_latest_cache_miss_with_session_rate() -> None:
+    session = FakeSession()
+    session.session_stats = SessionStats(
+        input_tokens=2_000,
+        output_tokens=300,
+        cached_input_tokens=500,
+        cache_write_tokens=500,
+        latest_prompt_tokens=1_000,
+    )
+    console = Console(record=True, width=80)
+
+    console.print(render_session_sidebar(session))
+
+    output = console.export_text()
+    assert "cache: 0% latest · 25% session" in output
 
 
 def test_session_sidebar_brand_includes_current_version() -> None:
@@ -2876,6 +2896,42 @@ def test_tui_app_registers_and_applies_custom_theme() -> None:
 
         assert app.theme == "midnight"
         assert app.get_theme_variable_defaults()["tau-screen-background"] == "#123456"
+    finally:
+        set_custom_tui_themes({})
+
+
+@pytest.mark.anyio
+async def test_tui_app_removes_source_project_themes_after_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tau_coding.tui.themes import (
+        THEME_COLOR_FIELDS,
+        TRANSCRIPT_ROLES,
+        available_tui_theme_names,
+        parse_tui_theme_json,
+        set_custom_tui_themes,
+    )
+
+    theme_data = {
+        "name": "project-theme",
+        "colors": dict.fromkeys(THEME_COLOR_FIELDS, "#123456"),
+        "roles": {role: {"border": "#123456", "body": "#e0e0e0"} for role in TRANSCRIPT_ROLES},
+    }
+    project_theme = parse_tui_theme_json(theme_data)
+    set_custom_tui_themes({"project-theme": project_theme})
+    monkeypatch.setattr(tui_app, "load_custom_tui_themes", lambda _dirs: ({}, []))
+    session = FakeSession()
+    session.theme_dirs = ()
+    app = TauTuiApp(session, tui_settings=TuiSettings(theme="project-theme"))
+    try:
+        async with app.run_test() as pilot:
+            await app._resume_session("destination-session")
+            await pilot.pause()
+
+            assert app.theme == "tau-dark"
+            assert "project-theme" not in app.available_themes
+            assert "project-theme" not in available_tui_theme_names()
+            assert app.tui_settings.theme == "project-theme"
     finally:
         set_custom_tui_themes({})
 
@@ -7885,6 +7941,79 @@ async def test_run_tui_app_falls_back_to_first_credentialed_provider(
         "run",
         "provider_closed",
     ]
+
+
+@pytest.mark.anyio
+async def test_run_tui_app_exits_when_startup_trust_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    isolate_home(monkeypatch, tmp_path)
+    calls: list[str] = []
+    record = CodingSessionRecord(
+        id="new-session",
+        path=tmp_path / "new-session.jsonl",
+        cwd=tmp_path,
+        model="gpt-5",
+        title=None,
+        created_at=1.0,
+        updated_at=1.0,
+        provider_name="openai",
+    )
+
+    class FakeProvider:
+        async def aclose(self) -> None:
+            calls.append("provider_closed")
+
+    class FakeManager:
+        def prepare_session(
+            self,
+            *,
+            cwd: Path,
+            model: str,
+            provider_name: str | None = None,
+        ) -> CodingSessionRecord:
+            calls.append("prepare")
+            return record
+
+        def get_session(self, session_id: str) -> CodingSessionRecord | None:
+            return None
+
+    class CancelledSession:
+        project_trust_resolution = SimpleNamespace(cancelled=True)
+
+        async def aclose(self) -> None:
+            calls.append("session_closed")
+
+    class FakeCodingSession:
+        @classmethod
+        async def load(cls, config: object) -> CancelledSession:
+            calls.append("load")
+            return CancelledSession()
+
+    class UnexpectedApp:
+        def __init__(self, session: object, **kwargs: object) -> None:
+            raise AssertionError("main TUI must not open after startup trust cancellation")
+
+    settings = ProviderSettings(
+        default_provider="openai",
+        providers=(
+            OpenAICompatibleProviderConfig(
+                name="openai",
+                models=("gpt-5",),
+                default_model="gpt-5",
+            ),
+        ),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "stored-key")
+    monkeypatch.setattr(tui_app, "load_provider_settings", lambda: settings)
+    monkeypatch.setattr(tui_app, "create_model_provider", lambda *args, **kwargs: FakeProvider())
+    monkeypatch.setattr(tui_app, "CodingSession", FakeCodingSession)
+    monkeypatch.setattr(tui_app, "TauTuiApp", UnexpectedApp)
+
+    result = await tui_app.run_tui_app(cwd=tmp_path, model=None, session_manager=FakeManager())
+
+    assert result is None
+    assert calls == ["prepare", "load", "session_closed", "provider_closed"]
 
 
 @pytest.mark.anyio

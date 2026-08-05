@@ -24,7 +24,6 @@ from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.events import Key, Resize
 from textual.screen import ModalScreen
-from textual.theme import Theme
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
@@ -98,6 +97,7 @@ from tau_coding.oauth_types import (
     OAuthPrompt,
     OAuthSelectPrompt,
 )
+from tau_coding.project_trust import ProjectTrustRequest, TrustChoice, TrustOverride
 from tau_coding.prompt_templates import PromptTemplate
 from tau_coding.provider_catalog import (
     BUILTIN_PROVIDER_CATALOG,
@@ -150,14 +150,16 @@ from tau_coding.tui.config import (
     save_tui_settings,
 )
 from tau_coding.tui.file_drop import normalize_dropped_paths
+from tau_coding.tui.project_trust import ProjectTrustScreen, prompt_project_trust
 from tau_coding.tui.state import TuiState, format_terminal_command_result_block
 from tau_coding.tui.terminal_notification import TerminalNotificationController
 from tau_coding.tui.terminal_title import TerminalTitleController
 from tau_coding.tui.themes import (
     available_tui_theme_names,
-    get_tui_theme,
     load_custom_tui_themes,
     set_custom_tui_themes,
+    textual_theme_for_tui_theme,
+    theme_css_variables,
 )
 from tau_coding.tui.widgets import (
     CompactSessionInfo,
@@ -166,6 +168,9 @@ from tau_coding.tui.widgets import (
     _custom_markup_to_text,
     render_completion_suggestions,
 )
+
+_textual_theme_for_tau_theme = textual_theme_for_tui_theme
+_theme_css_variables = theme_css_variables
 
 type BindingEntry = Binding | tuple[str, str] | tuple[str, str, str]
 SIDEBAR_MIN_WIDTH = 96
@@ -3141,8 +3146,13 @@ class TauTuiApp(App[None]):
 
     ExtensionSelectScreen,
     ExtensionConfirmScreen,
-    ExtensionInputScreen {
+    ExtensionInputScreen,
+    ProjectTrustScreen {
         align: center middle;
+    }
+
+    ProjectTrustScreen {
+        background: $tau-screen-background 60%;
     }
 
     #extension-select,
@@ -3191,6 +3201,40 @@ class TauTuiApp(App[None]):
         height: 1;
         margin-top: 1;
         color: $tau-muted-text;
+    }
+
+    #project-trust-dialog {
+        width: 76;
+        max-width: 92%;
+        height: auto;
+        max-height: 90%;
+        padding: 1 2;
+        background: $tau-chrome-background;
+        color: $tau-chrome-text;
+        border: tall $tau-border;
+    }
+
+    #project-trust-title {
+        color: $tau-chrome-text;
+    }
+
+    #project-trust-path-label,
+    #project-trust-summary-label,
+    #project-trust-boundary,
+    #project-trust-help {
+        color: $tau-muted-text;
+    }
+
+    #project-trust-list {
+        background: $tau-transcript-background;
+        color: $tau-screen-text;
+        border: tall $tau-border;
+    }
+
+    #project-trust-list ListItem.-highlight,
+    #project-trust-list ListItem.-highlight Label {
+        background: $tau-highlight-background;
+        color: $tau-highlight-text;
     }
 
     #command-output {
@@ -3471,6 +3515,10 @@ class TauTuiApp(App[None]):
         self._supports_pyperclip: bool | None = None
         self._sync_session_title()
 
+    async def prompt_project_trust(self, request: ProjectTrustRequest) -> TrustChoice | None:
+        """Resolve a trust request through the active Textual modal stack."""
+        return await self.push_screen_wait(ProjectTrustScreen(request))
+
     def _sync_session_title(self) -> None:
         """Reflect the active session name in the terminal tab title."""
         self._sync_terminal_title()
@@ -3520,6 +3568,47 @@ class TauTuiApp(App[None]):
         self._registered_themes.clear()
         for theme_name in available_tui_theme_names():
             self.register_theme(_textual_theme_for_tau_theme(theme_name))
+
+    def _reload_session_themes(self) -> None:
+        """Rebind custom themes to the active session's accepted trust snapshot."""
+        theme_dirs = getattr(self.session, "theme_dirs", None)
+        if theme_dirs is None:
+            trust_resolution = getattr(self.session, "project_trust_resolution", None)
+            trusted = trust_resolution is None or trust_resolution.trusted
+            theme_dirs = TauResourcePaths(
+                cwd=self.session.cwd,
+                project_resources_enabled=trusted,
+            ).themes_dirs
+        try:
+            custom_themes, diagnostics = load_custom_tui_themes(theme_dirs)
+        except (OSError, RuntimeError) as exc:
+            # Theme discovery must fail closed after a trust/cwd transition:
+            # never retain themes from the previous project snapshot.
+            custom_themes = {}
+            diagnostics = []
+            self._notify(f"Could not reload custom themes: {exc}", severity="error")
+
+        set_custom_tui_themes(custom_themes)
+        self._register_tau_textual_themes()
+        resolved_theme = self.tui_settings.resolved_theme.name
+        self._applying_settings_theme = True
+        try:
+            if self.theme == resolved_theme:
+                # Re-apply CSS when a same-named custom theme changed in place.
+                self._watch_theme(resolved_theme)
+            else:
+                self.theme = resolved_theme
+        finally:
+            self._applying_settings_theme = False
+        for diagnostic in diagnostics:
+            severity: Literal["information", "warning", "error"] = (
+                "error"
+                if diagnostic.severity == "error"
+                else "warning"
+                if diagnostic.severity == "warning"
+                else "information"
+            )
+            self._notify(diagnostic.format(), severity=severity)
 
     def _watch_theme(self, theme_name: str) -> None:
         """Keep Textual theme changes synchronized with Tau's durable TUI theme."""
@@ -3771,6 +3860,7 @@ class TauTuiApp(App[None]):
                 except ValueError as exc:
                     command = replace(command, message=f"Could not reload: {exc}")
                 else:
+                    self._reload_session_themes()
                     command = replace(command, message=format_reload_summary(summary))
             if command.new_session_requested:
                 await self._new_session()
@@ -4852,7 +4942,8 @@ class TauTuiApp(App[None]):
             | LoginProviderPickerScreen
             | ThemePickerScreen
             | ExtensionSelectScreen
-            | ExtensionConfirmScreen,
+            | ExtensionConfirmScreen
+            | ProjectTrustScreen,
         ):
             self.screen.action_select_cursor()
             return
@@ -4882,7 +4973,8 @@ class TauTuiApp(App[None]):
             | ModelPickerScreen
             | ToolsReferenceScreen
             | ExtensionSelectScreen
-            | ExtensionConfirmScreen,
+            | ExtensionConfirmScreen
+            | ProjectTrustScreen,
         ):
             self.screen.action_cursor_down()
             return
@@ -4909,7 +5001,8 @@ class TauTuiApp(App[None]):
             | ModelPickerScreen
             | ToolsReferenceScreen
             | ExtensionSelectScreen
-            | ExtensionConfirmScreen,
+            | ExtensionConfirmScreen
+            | ProjectTrustScreen,
         ):
             self.screen.action_cursor_up()
             return
@@ -5079,6 +5172,7 @@ class TauTuiApp(App[None]):
     async def _resume_session(self, session_id: str) -> None:
         try:
             resume_message = await self.session.resume(session_id)
+            self._reload_session_themes()
             self.state.clear()
             self.state.set_skills(self.session.skills)
             self._load_session_messages_from_session()
@@ -5171,6 +5265,7 @@ class TauTuiApp(App[None]):
             return
         try:
             await new_session()
+            self._reload_session_themes()
             self.state.clear()
             self.state.set_skills(self.session.skills)
             self._load_session_messages_from_session()
@@ -6317,62 +6412,6 @@ def _is_thinking_cycle_key(key: str, configured_key: str) -> bool:
     return configured_key == "shift+tab" and key == "backtab"
 
 
-def _textual_theme_for_tau_theme(theme_name: TuiThemeName) -> Theme:
-    """Map a Tau theme to Textual's native theme type."""
-    theme = get_tui_theme(theme_name)
-    return Theme(
-        name=theme.name,
-        primary=theme.accent,
-        secondary=theme.prompt_border,
-        warning=theme.markdown_bullet,
-        error=theme.error,
-        success=theme.success,
-        accent=theme.accent,
-        foreground=theme.screen_text,
-        background=theme.screen_background,
-        surface=theme.chrome_background,
-        panel=theme.sidebar_background,
-        dark=theme.dark,
-        variables=_theme_css_variables(theme),
-    )
-
-
-def _theme_css_variables(theme: TuiTheme) -> dict[str, str]:
-    """Return Textual CSS variables for a resolved Tau theme."""
-    return {
-        "tau-screen-background": theme.screen_background,
-        "tau-screen-text": theme.screen_text,
-        "tau-chrome-background": theme.chrome_background,
-        "tau-chrome-text": theme.chrome_text,
-        "tau-muted-text": theme.muted_text,
-        "tau-sidebar-background": theme.sidebar_background,
-        "tau-border": theme.border,
-        "tau-transcript-background": theme.transcript_background,
-        "tau-prompt-background": theme.prompt_background,
-        "tau-prompt-text": theme.prompt_text,
-        "tau-prompt-border": theme.prompt_border,
-        "tau-autocomplete-background": theme.autocomplete_background,
-        "tau-accent": theme.accent,
-        "tau-tool-running": theme.role_styles["tool"].border,
-        "tau-highlight-background": theme.highlight_background,
-        "tau-highlight-text": theme.highlight_text,
-        "tau-markdown-highlight": theme.markdown_heading,
-        "tau-markdown-table-header": theme.markdown_table_header,
-        "tau-markdown-table-border": theme.markdown_table_border,
-        "tau-markdown-inline-code": theme.markdown_inline_code,
-        "tau-markdown-code-block-background": theme.markdown_code_block_background,
-        "tau-markdown-link": theme.markdown_link,
-        "tau-markdown-bullet": theme.markdown_bullet,
-        "footer-background": theme.chrome_background,
-        "footer-foreground": theme.chrome_text,
-        "footer-description-background": theme.chrome_background,
-        "footer-description-foreground": theme.chrome_text,
-        "footer-key-background": theme.chrome_background,
-        "footer-key-foreground": theme.accent,
-        "footer-item-background": theme.chrome_background,
-    }
-
-
 def _render_queued_messages(state: TuiState, *, theme: TuiTheme) -> Group:
     """Render queued prompts stacked above the prompt input."""
     rows: list[Text] = []
@@ -6720,6 +6759,7 @@ async def run_tui_app(
     project_extensions_enabled: bool = False,
     custom_system_prompt: str | None = None,
     append_system_prompt: str | None = None,
+    trust_override: TrustOverride | None = None,
 ) -> str | None:
     """Run the Textual app and return the active id when its session is persisted."""
     if new_session and session_id is not None:
@@ -6795,11 +6835,24 @@ async def run_tui_app(
                 project_extensions_enabled=project_extensions_enabled,
                 custom_system_prompt=custom_system_prompt,
                 append_system_prompt=append_system_prompt,
+                trust_override=trust_override,
+                trust_default=shell_settings.default_project_trust,
+                trust_interactive=True,
+                trust_prompt=prompt_project_trust,
             )
         )
-        custom_themes, theme_diagnostics = load_custom_tui_themes(
-            TauResourcePaths(cwd=record.cwd).themes_dirs
-        )
+        trust_resolution = getattr(session, "project_trust_resolution", None)
+        if trust_resolution is not None and trust_resolution.cancelled:
+            return None
+
+        theme_dirs = getattr(session, "theme_dirs", None)
+        if theme_dirs is None:
+            trusted = trust_resolution is None or trust_resolution.trusted
+            theme_dirs = TauResourcePaths(
+                cwd=record.cwd,
+                project_resources_enabled=trusted,
+            ).themes_dirs
+        custom_themes, theme_diagnostics = load_custom_tui_themes(theme_dirs)
         set_custom_tui_themes(custom_themes)
         legacy_notices = (startup_notice,) if startup_notice else ()
         error_notices = (startup_error_notice,) if startup_error_notice else ()
@@ -6815,6 +6868,9 @@ async def run_tui_app(
             startup_notices=all_startup_notices,
             initial_prompt=initial_prompt,
         )
+        set_trust_prompt = getattr(session, "set_project_trust_prompt", None)
+        if set_trust_prompt is not None:
+            set_trust_prompt(app.prompt_project_trust)
         await app.run_async()
     finally:
         if session is not None:
