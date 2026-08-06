@@ -150,6 +150,22 @@ default references after merging. Bundled tombstones therefore prevent stale
 user overlays from restoring models that Tau previously advertised for the wrong
 provider. They do not affect the same model ID on another provider.
 
+### OpenAI prompt-cache compat keys
+
+Tau enables OpenAI cache affinity automatically only for `api.openai.com` and the
+dedicated Codex OAuth provider. OpenAI-compatible gateways can opt in per provider
+or model:
+
+| Key | Effect |
+| --- | --- |
+| `supportsPromptCacheKey` | Sends the stable session-derived `prompt_cache_key` body field |
+| `sendSessionAffinityHeaders` | Sends headers using `sessionAffinityFormat` |
+| `sessionAffinityFormat` | `openai` sends `session_id`; `openrouter` sends `x-session-id` |
+
+Unknown gateways retain their existing request shape by default. Enable only fields
+documented by the target service. Codex uses its dedicated `session-id` header
+mapping and does not read these OpenAI-compatible settings.
+
 ### Anthropic prompt-cache compat keys
 
 Providers using the `anthropic-messages` API accept three `compat` booleans
@@ -202,6 +218,11 @@ Limits are inclusive, must increase strictly, and the final tier must omit
 `max_input_tokens` so every valid input size has a rate. Callers that understand
 tiers should select the first tier whose limit includes the input-token count;
 older callers continue to see `cost` as the base rate.
+
+All rates are per million tokens. `cacheWrite` is the 5-minute cache-write
+rate; entries may add an optional `cacheWrite1h` rate for Anthropic's 1-hour
+TTL cache writes, which Anthropic bills higher. When `cacheWrite1h` is absent,
+1-hour writes fall back to the `cacheWrite` rate.
 
 ### Provider preferences
 

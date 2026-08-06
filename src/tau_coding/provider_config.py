@@ -1503,6 +1503,10 @@ def _detected_compat(provider: ProviderConfig, model: str) -> dict[str, Any]:
     is_deepseek = provider.name == "deepseek" or "deepseek.com" in base_url
     is_cerebras = provider.name == "cerebras" or "cerebras.ai" in base_url
     is_openrouter = provider.name == "openrouter" or "openrouter.ai" in base_url
+    is_openai_api = (
+        urlsplit(base_url).hostname == urlsplit(DEFAULT_OPENAI_COMPATIBLE_BASE_URL).hostname
+    )
+    is_openai_responses = _provider_api(provider, model) == "openai-responses"
     is_nonstandard = is_cerebras or is_grok or is_together or is_deepseek or is_zai or is_moonshot
     use_max_tokens = is_moonshot or is_together
     is_anthropic_api = urlsplit(base_url).hostname == urlsplit(DEFAULT_ANTHROPIC_BASE_URL).hostname
@@ -1524,6 +1528,12 @@ def _detected_compat(provider: ProviderConfig, model: str) -> dict[str, Any]:
         ),
         "supportsStrictMode": not (is_moonshot or is_together),
         "supportsLongCacheRetention": not is_together,
+        # OpenAI's prompt-cache fields and affinity headers are not universally
+        # accepted by compatible gateways. Default them on only for the official
+        # endpoint; provider/model compat can opt another route in explicitly.
+        "supportsPromptCacheKey": is_openai_api,
+        "sendSessionAffinityHeaders": is_openai_api and is_openai_responses,
+        "sessionAffinityFormat": "openrouter" if is_openrouter else "openai",
         # Only first-party Anthropic is known to accept cache_control. Several
         # catalog providers speak the Anthropic protocol through a gateway, and one
         # proxies to non-Anthropic models, so they default to no breakpoints. This
@@ -2355,13 +2365,24 @@ def _cost_tiers(value: object, field_name: str) -> tuple[ModelCostTier, ...]:
         if not isinstance(item, dict):
             raise ProviderConfigError(f"Provider cost tiers must be objects: {field_name}")
         tier_field = f"{field_name}.{index}"
-        allowed = {"max_input_tokens", "input", "output", "cacheRead", "cacheWrite"}
+        allowed = {
+            "max_input_tokens",
+            "input",
+            "output",
+            "cacheRead",
+            "cacheWrite",
+            "cacheWrite1h",
+        }
         if set(item) - allowed:
             raise ProviderConfigError(f"Provider cost tier has unknown fields: {tier_field}")
         cost = {
             key: _non_negative_float(item.get(key), f"{tier_field}.{key}")
             for key in ("input", "output", "cacheRead", "cacheWrite")
         }
+        if item.get("cacheWrite1h") is not None:
+            cost["cacheWrite1h"] = _non_negative_float(
+                item.get("cacheWrite1h"), f"{tier_field}.cacheWrite1h"
+            )
         tiers.append(
             ModelCostTier(
                 max_input_tokens=_optional_positive_int(

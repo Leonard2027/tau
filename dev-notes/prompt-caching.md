@@ -1,4 +1,33 @@
-# Anthropic prompt caching
+# Prompt caching
+
+## OpenAI cache affinity
+
+OpenAI automatically caches matching prompt prefixes, but successive requests are
+more likely to reuse the same cache when the client supplies one stable affinity
+key. Tau carries its durable coding-session id through `AgentHarness` into every
+model request, including tool continuations, and clamps it to OpenAI's 64-character
+`prompt_cache_key` limit.
+
+Direct OpenAI Responses requests send the same value as `prompt_cache_key` in
+the request body and `session_id` in the request headers. Codex OAuth uses the
+same body field, but its subscription backend spells the header `session-id`.
+Direct Chat Completions sends only `prompt_cache_key`.
+
+Tau deliberately omits the optional `x-client-request-id` header. OpenAI defines
+it as a unique per-request diagnostic identifier, not a stable cache-affinity key;
+reusing the session id there would make individual requests ambiguous in provider
+logs. This remains stateless operation: Tau keeps `store: false` and
+resends the complete transcript. The id helps routing and grouping; it cannot make
+a changed system prompt, tool schema, or transcript prefix cacheable.
+
+Compatible gateways default to the old payload and header shape because support is
+not universal. `supportsPromptCacheKey`, `sendSessionAffinityHeaders`, and
+`sessionAffinityFormat` catalog compat values can opt a known route in. New and
+branched sessions receive a new key; resumed sessions retain theirs. Summary and
+compaction calls intentionally omit the id because their one-off prompts do not
+share the conversation prefix.
+
+## Anthropic breakpoint caching
 
 Tau's Anthropic provider parsed and priced cache usage from the very first
 release — `Usage.cache_read`, `Usage.cache_write`, and `cache_write_1h` are all
