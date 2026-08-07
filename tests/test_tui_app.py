@@ -57,6 +57,7 @@ from tau_coding.prompt_templates import PromptTemplate
 from tau_coding.provider_config import (
     OpenAICodexProviderConfig,
     OpenAICompatibleProviderConfig,
+    ProviderSelection,
     ProviderSettings,
     ScopedModelConfig,
     save_provider_settings,
@@ -672,7 +673,7 @@ def test_session_sidebar_brand_includes_current_version() -> None:
 
     console.print(_sidebar_brand(theme=TAU_DARK_THEME))
 
-    assert "τ = 2π  0.3.7" in console.export_text()
+    assert "τ = 2π  0.3.8" in console.export_text()
 
 
 def test_session_sidebar_uses_prominent_title_and_accented_section_headers() -> None:
@@ -7840,6 +7841,30 @@ async def test_tui_app_runs_initial_prompt() -> None:
 
     assert session.prompt_texts == ["explain this repo"]
     assert any(item.role == "user" and item.text == "explain this repo" for item in app.state.items)
+
+
+def test_huggingface_startup_route_prefers_resumed_session_pin(tmp_path: Path) -> None:
+    provider = OpenAICompatibleProviderConfig(
+        name="huggingface",
+        models=("zai-org/GLM-5.2",),
+        default_model="zai-org/GLM-5.2",
+        inference_providers={"zai-org/GLM-5.2": "deepinfra"},
+    )
+    selection = ProviderSelection(provider=provider, model="zai-org/GLM-5.2")
+    record = CodingSessionRecord(
+        id="session-id",
+        path=tmp_path / "session.jsonl",
+        cwd=tmp_path,
+        model="zai-org/GLM-5.2",
+        title=None,
+        created_at=1.0,
+        updated_at=1.0,
+        provider_name="huggingface",
+        inference_provider="fireworks-ai",
+    )
+
+    assert tui_app._startup_inference_provider(selection, record) == "fireworks-ai"
+    assert tui_app._startup_inference_provider(selection, None) == "deepinfra"
 
 
 @pytest.mark.anyio
