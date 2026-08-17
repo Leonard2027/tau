@@ -102,6 +102,7 @@ def test_builtin_catalog_golden_anthropic_entry() -> None:
         "claude-opus-4-5-20251101",
         "claude-opus-4-6",
         "claude-opus-4-7",
+        "claude-opus-5",
         "claude-sonnet-4-5",
         "claude-sonnet-4-5-20250929",
         "claude-sonnet-4-6",
@@ -119,11 +120,23 @@ def test_builtin_catalog_golden_anthropic_entry() -> None:
         "claude-opus-4-5-20251101": 200_000,
         "claude-opus-4-6": 1_000_000,
         "claude-opus-4-7": 1_000_000,
+        "claude-opus-5": 1_000_000,
         "claude-sonnet-4-5": 200_000,
         "claude-sonnet-4-5-20250929": 200_000,
         "claude-sonnet-4-6": 1_000_000,
         "claude-sonnet-5": 1_000_000,
     }
+    opus_5 = entry.model_metadata["claude-opus-5"]
+    assert opus_5.context_window == 1_000_000
+    assert opus_5.max_tokens == 128_000
+    assert opus_5.input == ("text", "image")
+    assert opus_5.cost is not None
+    assert opus_5.cost["input"] == 5
+    assert opus_5.cost["output"] == 25
+    assert opus_5.cost["cacheWrite"] == 6.25
+    assert opus_5.cost["cacheWrite1h"] == 10
+    assert opus_5.compat == {"forceAdaptiveThinking": True}
+    assert opus_5.thinking_level_map == {"minimal": None, "xhigh": "max"}
     assert entry.thinking_levels == ("off", "minimal", "low", "medium", "high", "xhigh")
     assert entry.thinking_models == ()
     assert entry.thinking_default == "medium"
@@ -143,11 +156,106 @@ def test_builtin_catalog_separates_openai_api_and_codex_context_limits() -> None
     assert "gpt-5.6" not in codex.models
     assert "gpt-5.6" not in codex.context_windows
     assert "gpt-5.6" not in codex.model_metadata
+    assert codex.removed_models == ("gpt-5.6",)
     assert openai.context_windows["gpt-5.6-sol"] == 1_050_000
     assert codex.context_windows["gpt-5.6-sol"] == 272_000
     assert codex.context_windows["gpt-5.6-terra"] == 272_000
     assert codex.context_windows["gpt-5.6-luna"] == 272_000
     assert codex.model_metadata["gpt-5.6-sol"].context_window == 272_000
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "vision_models"),
+    [
+        (
+            "openai-codex",
+            {
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+                "gpt-5.2",
+            },
+        ),
+        (
+            "opencode-go",
+            {
+                "kimi-k2.6",
+                "kimi-k2.7-code",
+                "mimo-v2.5",
+                "minimax-m3",
+                "qwen3.6-plus",
+                "qwen3.7-plus",
+            },
+        ),
+        (
+            "opencode",
+            {
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.5",
+                "gpt-5.5-pro",
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "grok-4.5",
+                "grok-build-0.1",
+                "kimi-k2.5",
+                "kimi-k2.6",
+                "kimi-k2.7-code",
+                "mimo-v2.5-free",
+                "minimax-m3",
+                "qwen3.5-plus",
+                "qwen3.6-plus",
+            },
+        ),
+        (
+            "github-copilot",
+            {
+                "claude-fable-5",
+                "claude-haiku-4.5",
+                "claude-opus-4.5",
+                "claude-opus-4.6",
+                "claude-opus-4.7",
+                "claude-opus-4.8",
+                "claude-sonnet-4",
+                "claude-sonnet-4.5",
+                "claude-sonnet-4.6",
+                "claude-sonnet-5",
+                "gemini-2.5-pro",
+                "gemini-3-flash-preview",
+                "gemini-3.1-pro-preview",
+                "gemini-3.5-flash",
+                "gpt-4.1",
+                "gpt-5-mini",
+                "gpt-5.2",
+                "gpt-5.2-codex",
+                "gpt-5.3-codex",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.4-nano",
+                "gpt-5.5",
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "kimi-k2.7-code",
+            },
+        ),
+    ],
+)
+def test_sparse_provider_catalogs_declare_model_input_modalities(
+    provider_name: str, vision_models: set[str]
+) -> None:
+    provider = builtin_provider_entry(provider_name)
+
+    assert provider is not None
+    assert set(provider.model_metadata) == set(provider.models)
+    assert {
+        model for model, metadata in provider.model_metadata.items() if "image" in metadata.input
+    } == vision_models
 
 
 def test_builtin_catalog_oauth_and_opencode_auth_methods() -> None:
@@ -162,6 +270,28 @@ def test_builtin_catalog_oauth_and_opencode_auth_methods() -> None:
     assert opencode is not None and opencode.auth_methods == ("api_key",)
     assert opencode_go.api_key_env == "OPENCODE_API_KEY"
     assert opencode.api_key_env == "OPENCODE_API_KEY"
+
+
+def test_builtin_catalog_copilot_claude_max_tokens() -> None:
+    entry = builtin_provider_entry("github-copilot")
+    assert entry is not None
+
+    expected = {
+        "claude-haiku-4.5": 64_000,
+        "claude-opus-4.5": 32_000,
+        "claude-opus-4.6": 32_000,
+        "claude-opus-4.7": 32_000,
+        "claude-opus-4.8": 64_000,
+        "claude-sonnet-4": 16_000,
+        "claude-sonnet-4.5": 32_000,
+        "claude-sonnet-4.6": 32_000,
+        "claude-sonnet-5": 128_000,
+    }
+
+    for model, max_tokens in expected.items():
+        metadata = entry.model_metadata[model]
+        assert metadata.api == "anthropic-messages"
+        assert metadata.max_tokens == max_tokens
 
 
 def test_builtin_catalog_golden_nvidia_entry() -> None:
@@ -237,6 +367,7 @@ def test_builtin_catalog_huggingface_model_expansion() -> None:
         "google/gemma-4-31B-it",
         "meta-llama/Llama-3.3-70B-Instruct",
         "moonshotai/Kimi-K2.7-Code",
+        "moonshotai/Kimi-K3",
         "openai/gpt-oss-120b",
         "openai/gpt-oss-20b",
         "stepfun-ai/Step-3.5-Flash",
@@ -248,7 +379,7 @@ def test_builtin_catalog_huggingface_model_expansion() -> None:
         "zai-org/GLM-5.2",
     }
 
-    assert len(entry.models) == 46
+    assert len(entry.models) == 47
     assert added_models <= set(entry.models)
     assert set(entry.context_windows or {}) == set(entry.models)
     assert set(entry.model_metadata) == set(entry.models)
@@ -262,6 +393,21 @@ def test_builtin_catalog_huggingface_model_expansion() -> None:
     llama = entry.model_metadata["meta-llama/Llama-3.3-70B-Instruct"]
     assert llama.reasoning is False
     assert llama.context_window == 131_072
+
+    kimi_k3 = entry.model_metadata["moonshotai/Kimi-K3"]
+    assert kimi_k3.name == "Kimi K3"
+    assert kimi_k3.reasoning is True
+    assert kimi_k3.input == ("text", "image")
+    assert kimi_k3.context_window == 1_048_576
+    assert kimi_k3.cost == {"input": 3, "output": 15, "cacheRead": 0, "cacheWrite": 0}
+    assert kimi_k3.thinking_level_map == {
+        "off": None,
+        "minimal": None,
+        "low": "low",
+        "medium": None,
+        "high": "high",
+        "xhigh": "max",
+    }
 
 
 def test_builtin_catalog_golden_kimi_entries() -> None:
@@ -301,19 +447,20 @@ def test_builtin_catalog_golden_kimi_entries() -> None:
     assert coding.credential_name == "kimi-code"
     assert coding.models == ("k3", "kimi-for-coding")
     assert coding.default_model == "kimi-for-coding"
+    assert coding.thinking_default == "xhigh"
     assert coding.context_windows == {"k3": 1_048_576, "kimi-for-coding": 262_144}
 
     k3 = coding.model_metadata["k3"]
     assert k3.name == "Kimi K3"
     assert k3.reasoning is True
-    assert k3.input == ("text",)
+    assert k3.input == ("text", "image")
     assert k3.context_window == 1_048_576
     assert k3.thinking_level_map == {
         "off": None,
         "minimal": None,
-        "low": None,
+        "low": "low",
         "medium": None,
-        "high": None,
+        "high": "high",
         "xhigh": "max",
     }
 
@@ -321,6 +468,13 @@ def test_builtin_catalog_golden_kimi_entries() -> None:
     assert latest.name == "Kimi for Coding (latest)"
     assert latest.reasoning is True
     assert latest.context_window == 262_144
+    assert latest.thinking_level_map == {
+        "off": None,
+        "minimal": None,
+        "low": None,
+        "high": None,
+        "xhigh": None,
+    }
 
 
 def test_builtin_minimax_m3_has_tiered_pricing() -> None:
@@ -407,6 +561,35 @@ default_model = "claude-next-1"
     assert entry.thinking_parameter == "anthropic.thinking"
 
 
+def test_builtin_tombstone_removes_model_from_user_catalog_overlay(tmp_path: Path) -> None:
+    paths = _write_user_catalog(
+        tmp_path / ".tau",
+        """
+[[providers]]
+name = "openai-codex"
+models = ["gpt-5.6"]
+default_model = "gpt-5.6"
+thinking_models = ["gpt-5.6"]
+
+[providers.context_windows]
+"gpt-5.6" = 272000
+
+[providers.model_metadata."gpt-5.6"]
+name = "GPT-5.6"
+""",
+    )
+
+    entry = next(e for e in effective_catalog(paths) if e.name == "openai-codex")
+
+    assert entry.default_model == "gpt-5.5"
+    assert "gpt-5.6" not in entry.models
+    assert "gpt-5.6" not in entry.thinking_models
+    assert entry.context_windows is not None
+    assert "gpt-5.6" not in entry.context_windows
+    assert "gpt-5.6" not in entry.model_metadata
+    assert entry.removed_models == ("gpt-5.6",)
+
+
 def test_user_catalog_thinking_fields_replace_as_group(tmp_path: Path) -> None:
     paths = _write_user_catalog(
         tmp_path / ".tau",
@@ -460,6 +643,38 @@ cost_tiers = [
         model_cost_for_input_tokens(reloaded.model_metadata["MiniMax-M3"], 400_001)
         == long_context_cost
     )
+
+
+def test_user_catalog_cost_tier_accepts_one_hour_cache_write_rate(tmp_path: Path) -> None:
+    paths = _write_user_catalog(
+        tmp_path / ".tau",
+        """
+[[providers]]
+name = "minimax"
+
+[providers.model_metadata."MiniMax-M3"]
+cost_tiers = [
+  { max_input_tokens = 400000, input = 0.2, output = 1.0, cacheRead = 0.04, cacheWrite = 0.25 },
+  { input = 0.5, output = 2.0, cacheRead = 0.1, cacheWrite = 0.6, cacheWrite1h = 1.0 },
+]
+""",
+    )
+    entry = next(e for e in effective_catalog(paths) if e.name == "minimax")
+    metadata = entry.model_metadata["MiniMax-M3"]
+    assert model_cost_for_input_tokens(metadata, 400_001) == {
+        "input": 0.5,
+        "output": 2.0,
+        "cacheRead": 0.1,
+        "cacheWrite": 0.6,
+        "cacheWrite1h": 1.0,
+    }
+    # Tiers without the key omit it, so billing can fall back to cacheWrite.
+    assert model_cost_for_input_tokens(metadata, 400_000) == {
+        "input": 0.2,
+        "output": 1.0,
+        "cacheRead": 0.04,
+        "cacheWrite": 0.25,
+    }
 
 
 def test_user_catalog_rejects_bounded_final_cost_tier(tmp_path: Path) -> None:

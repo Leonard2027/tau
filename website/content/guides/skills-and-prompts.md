@@ -30,7 +30,10 @@ Prompt templates load from:
 
 After adding or editing files while the TUI is open, run **`/reload`** to
 rediscover them. Duplicate/overridden resources are reported as diagnostics, not
-fatal errors.
+fatal errors. At TUI startup, Tau also shows a red transcript alert when skills or
+prompt templates in different locations share a name. The alert lists both paths
+so you can rename or remove the unintended duplicate; Tau still uses the
+higher-precedence resource.
 
 ## Skills
 
@@ -84,15 +87,25 @@ explicitly:
 /skill:security-review check the changes on this branch
 ```
 
-`/skill:<name>` is a *prompt-expansion* path — Tau expands the skill into your
-prompt and runs it as a normal turn.
+For longer instructions, put the request on following lines:
+
+```text
+/skill:security-review
+
+Check the changes on this branch.
+Pay special attention to authentication boundaries.
+```
+
+`/skill:<name>` is a *prompt-expansion* path — Tau expands the skill and any
+inline or multiline request into your prompt, then runs it as a normal turn.
 
 ## Prompt templates
 
 A prompt template is a saved prompt you trigger by its filename. For example,
 `~/.agents/prompts/wt.md` is invoked with `/wt`. Run `/prompts` in the TUI to
-search every loaded template and insert its invocation for editing; selection
-does not submit the prompt. The filenames `prompts.md` and `tools.md` are
+search every loaded template. Press **Enter** to insert its invocation without
+submitting it, or **Ctrl+E** to edit its Markdown directly. Save with **Ctrl+S**;
+Tau reloads resources automatically. The filenames `prompts.md` and `tools.md` are
 reserved for built-in commands; Tau ignores templates with those names and
 reports a resource diagnostic. Templates can include variables with `{{ name }}`:
 

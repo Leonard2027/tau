@@ -26,6 +26,11 @@ class Skill:
     description: str | None = None
 
 
+def is_skill_candidate(path: Path) -> bool:
+    """Return whether an entry is a loader-eligible ``*/SKILL.md`` candidate."""
+    return path.name == "SKILL.md" and (path.is_file() or path.is_symlink())
+
+
 @dataclass(frozen=True, slots=True)
 class SkillInvocation:
     """Parsed expanded skill invocation message."""
@@ -91,7 +96,9 @@ def expand_skill_command(text: str, skills: Sequence[Skill]) -> str | None:
     if not stripped.startswith("/skill:"):
         return None
 
-    command, separator, request = stripped.partition(" ")
+    command_and_request = stripped.split(maxsplit=1)
+    command = command_and_request[0]
+    request = command_and_request[1] if len(command_and_request) > 1 else None
     name = command.removeprefix("/skill:").strip()
     if not name:
         raise ResourceError("Skill command must include a skill name")
@@ -101,7 +108,7 @@ def expand_skill_command(text: str, skills: Sequence[Skill]) -> str | None:
     if skill is None:
         raise ResourceError(f"Unknown skill: {name}")
 
-    additional_instructions = request.strip() if separator else None
+    additional_instructions = request.strip() if request is not None else None
     return format_skill_invocation(skill, additional_instructions)
 
 

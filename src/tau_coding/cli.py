@@ -23,6 +23,7 @@ from tau_coding.catalog_loader import user_catalog_path
 from tau_coding.commands import format_reload_summary
 from tau_coding.credentials import FileCredentialStore
 from tau_coding.extensions import StderrUiBridge
+from tau_coding.project_trust import TrustDefault, TrustOverride
 from tau_coding.provider_config import (
     DEFAULT_MODEL,
     DEFAULT_PROVIDER_NAME,
@@ -52,7 +53,7 @@ from tau_coding.session_export import (
     export_session_artifact,
     normalize_export_format,
 )
-from tau_coding.session_manager import CodingSessionRecord, SessionManager
+from tau_coding.session_manager import CodingSessionRecord, SessionManager, validate_session_id
 from tau_coding.shell_config import load_shell_settings
 from tau_coding.tui import run_tui_app
 from tau_coding.update_check import (
@@ -216,7 +217,7 @@ def main(
     ] = None,
     session: Annotated[
         str | None,
-        typer.Option("--session", help="Resume a session id in TUI mode."),
+        typer.Option("--session", help="Resume a session id in TUI or print mode."),
     ] = None,
     resume: Annotated[
         str | None,
@@ -230,6 +231,29 @@ def main(
         bool,
         typer.Option("--new-session", help="Create a new session in TUI mode (default)."),
     ] = False,
+    session_id: Annotated[
+        str | None,
+        typer.Option(
+            "--session-id",
+            help="Set the exact id for the newly created print-mode session.",
+        ),
+    ] = None,
+    system_prompt: Annotated[
+        str | None,
+        typer.Option(
+            "--system-prompt",
+            metavar="TEXT_OR_PATH",
+            help="Replace the default system-prompt base with literal text or a UTF-8 file.",
+        ),
+    ] = None,
+    append_system_prompt: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--append-system-prompt",
+            metavar="TEXT_OR_PATH",
+            help="Append literal text or a UTF-8 file to the system prompt (repeatable).",
+        ),
+    ] = None,
     auto_compact_threshold: Annotated[
         int | None,
         typer.Option(
@@ -271,8 +295,16 @@ def main(
         bool,
         typer.Option(
             "--project-extensions",
-            help="Also load project .tau/extensions (runs project-supplied code at startup).",
+            help="Also load trusted project .tau/extensions (additional code opt-in).",
         ),
+    ] = False,
+    approve: Annotated[
+        bool,
+        typer.Option("--approve", "-a", help="Trust protected project inputs for this run."),
+    ] = False,
+    no_approve: Annotated[
+        bool,
+        typer.Option("--no-approve", "-na", help="Decline protected project inputs for this run."),
     ] = False,
     version: Annotated[
         bool,
@@ -288,6 +320,12 @@ def main(
     if ctx.invoked_subcommand is not None:
         return
 
+    if approve and no_approve:
+        raise typer.BadParameter("--approve and --no-approve cannot be used together")
+    trust_override: TrustOverride | None = (
+        "approve" if approve else "decline" if no_approve else None
+    )
+
     if resume is not None:
         raise typer.BadParameter(
             f"--resume was renamed to --session. Use `tau --session {resume}` instead."
@@ -295,6 +333,8 @@ def main(
 
     if session is not None and new_session:
         raise typer.BadParameter("--session and --new-session cannot be used together")
+    if session is not None and session_id is not None:
+        raise typer.BadParameter("--session and --session-id cannot be used together")
 
     if prompt_option is not None:
         raise typer.BadParameter(
@@ -312,6 +352,14 @@ def main(
 
     print_requested = print_mode or mode is not None
     effective_output = mode or PrintOutputMode.text
+
+    if session_id is not None:
+        if not print_requested:
+            raise typer.BadParameter("--session-id is only supported in print mode")
+        try:
+            validate_session_id(session_id)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
 
     positional_args = prompt_args or []
     command = positional_args[0] if positional_args else None
@@ -353,12 +401,17 @@ def main(
         raise typer.Exit()
 
     extension_paths = tuple(extension or ())
+    custom_system_prompt = (
+        _resolve_prompt_input(system_prompt, option="--system-prompt")
+        if system_prompt is not None
+        else None
+    )
+    resolved_append_system_prompt = _resolve_append_system_prompts(append_system_prompt or ())
 
     if not print_requested:
         notice = _startup_update_notice()
         try:
-            resumable_session_id = anyio.run(
-                run_openai_tui,
+            tui_args = (
                 model,
                 cwd or Path.cwd(),
                 session,
@@ -370,6 +423,13 @@ def main(
                 extension_paths,
                 not no_extensions,
                 project_extensions,
+                custom_system_prompt,
+                resolved_append_system_prompt,
+            )
+            resumable_session_id = (
+                anyio.run(run_openai_tui, *tui_args)
+                if trust_override is None
+                else anyio.run(run_openai_tui, *tui_args, trust_override)
             )
         except (RuntimeError, ValueError) as exc:
             raise typer.BadParameter(str(exc)) from exc
@@ -389,8 +449,7 @@ def main(
         typer.echo(notice.message, err=True)
 
     try:
-        ok = anyio.run(
-            run_openai_print_mode,
+        print_args = (
             prompt,
             model,
             cwd or Path.cwd(),
@@ -400,7 +459,18 @@ def main(
             extension_paths,
             not no_extensions,
             project_extensions,
+            session_id,
+            custom_system_prompt,
+            resolved_append_system_prompt,
         )
+        if session is not None:
+            ok = anyio.run(run_openai_print_mode, *print_args, trust_override, session)
+        else:
+            ok = (
+                anyio.run(run_openai_print_mode, *print_args)
+                if trust_override is None
+                else anyio.run(run_openai_print_mode, *print_args, trust_override)
+            )
     except (RuntimeError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if not ok:
@@ -419,6 +489,9 @@ async def run_openai_tui(
     extension_paths: tuple[Path, ...] = (),
     extensions_enabled: bool = True,
     project_extensions_enabled: bool = False,
+    custom_system_prompt: str | None = None,
+    append_system_prompt: str | None = None,
+    trust_override: TrustOverride | None = None,
 ) -> str | None:
     """Run the Textual TUI and return its resumable session id, if any."""
     release_notes_notice = startup_release_notes_notice(_current_version())
@@ -436,6 +509,9 @@ async def run_openai_tui(
         extension_paths=extension_paths,
         extensions_enabled=extensions_enabled,
         project_extensions_enabled=project_extensions_enabled,
+        custom_system_prompt=custom_system_prompt,
+        append_system_prompt=append_system_prompt,
+        trust_override=trust_override,
     )
 
 
@@ -455,7 +531,10 @@ def update_command() -> None:
         typer.echo(result.stdout)
     if result.stderr:
         typer.echo(result.stderr, err=True)
-    typer.echo(f"Tau update completed with: {' '.join(result.command or ())}")
+    if result.deferred:
+        typer.echo(f"Tau update handed off with: {' '.join(result.command or ())}")
+    else:
+        typer.echo(f"Tau update completed with: {' '.join(result.command or ())}")
 
 
 def render_session_list(records: list[CodingSessionRecord]) -> None:
@@ -512,6 +591,39 @@ def _run_export_cli(args: list[str]) -> None:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(f"Exported session to {exported_path}")
     raise typer.Exit()
+
+
+def _resolve_prompt_input(value: str, *, option: str) -> str:
+    """Resolve an existing UTF-8 file, otherwise preserve literal prompt text."""
+    try:
+        path = Path(value).expanduser()
+    except RuntimeError:
+        return value
+    try:
+        exists = path.exists()
+    except OSError as exc:
+        raise typer.BadParameter(
+            f"Could not inspect {option} path {path}: {exc}",
+            param_hint=option,
+        ) from exc
+    if not exists:
+        return value
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise typer.BadParameter(
+            f"Could not read {option} file {path}: {exc}",
+            param_hint=option,
+        ) from exc
+
+
+def _resolve_append_system_prompts(values: tuple[str, ...] | list[str]) -> str | None:
+    """Resolve repeated append inputs in order and separate them by one blank line."""
+    if not values:
+        return None
+    return "\n\n".join(
+        _resolve_prompt_input(value, option="--append-system-prompt") for value in values
+    )
 
 
 def _merge_stdin_prompt(prompt: str) -> str:
@@ -655,18 +767,48 @@ async def run_openai_print_mode(
     extension_paths: tuple[Path, ...] = (),
     extensions_enabled: bool = True,
     project_extensions_enabled: bool = False,
+    session_id: str | None = None,
+    custom_system_prompt: str | None = None,
+    append_system_prompt: str | None = None,
+    trust_override: TrustOverride | None = None,
+    resume_session_id: str | None = None,
 ) -> bool:
-    """Run print mode with the OpenAI-compatible provider configured from the environment."""
+    """Run a new or resumed print-mode turn using the configured provider."""
     settings = load_provider_settings()
     shell_settings = load_shell_settings()
-    selection = resolve_provider_selection(settings, provider_name=provider_name, model=model)
+    manager = session_manager or SessionManager()
+    record = _print_session_record(
+        manager,
+        resume_session_id=resume_session_id,
+        cwd=cwd,
+        settings=settings,
+        provider_name=provider_name,
+        model=model,
+        session_id=session_id,
+    )
+    explicit_selection = provider_name is not None or model is not None
+    selection = resolve_provider_selection(
+        settings,
+        provider_name=provider_name if explicit_selection else record.provider_name,
+        model=model if explicit_selection else record.model,
+    )
+    inference_provider = (
+        record.inference_provider
+        if resume_session_id is not None
+        and record.provider_name == "huggingface"
+        and selection.provider.name == "huggingface"
+        and record.model == selection.model
+        else selection.provider.inference_providers.get(selection.model)
+        if isinstance(selection.provider, OpenAICompatibleProviderConfig)
+        and selection.provider.name == "huggingface"
+        else None
+    )
     provider = create_model_provider(
         selection.provider,
         model=selection.model,
+        inference_provider=inference_provider,
         thinking_level=resolve_startup_thinking_level(selection.provider, selection.model),
     )
-    manager = session_manager or SessionManager()
-    record = manager.create_session(cwd=cwd, model=selection.model)
     try:
         return await run_print_mode(
             prompt=prompt,
@@ -678,15 +820,74 @@ async def run_openai_print_mode(
             session_id=record.id,
             session_manager=manager,
             provider_name=selection.provider.name,
+            inference_provider=inference_provider,
             provider_settings=settings,
             runtime_provider_config=selection.provider,
             shell_command_prefix=shell_settings.shell_command_prefix,
             extension_paths=extension_paths,
             extensions_enabled=extensions_enabled,
             project_extensions_enabled=project_extensions_enabled,
+            custom_system_prompt=custom_system_prompt,
+            append_system_prompt=append_system_prompt,
+            trust_override=trust_override,
+            trust_default=shell_settings.default_project_trust,
+            startup_model_override=provider_name is not None or model is not None,
         )
     finally:
         await provider.aclose()
+
+
+def _print_session_record(
+    manager: SessionManager,
+    *,
+    resume_session_id: str | None,
+    cwd: Path,
+    settings: ProviderSettings,
+    provider_name: str | None,
+    model: str | None,
+    session_id: str | None,
+) -> CodingSessionRecord:
+    """Resolve a resumed transcript or exclusively create a new one."""
+    if resume_session_id is not None:
+        record = manager.get_session(resume_session_id)
+        if record is None:
+            raise ValueError(f"Unknown session: {resume_session_id}")
+        return record
+
+    selection = resolve_provider_selection(settings, provider_name=provider_name, model=model)
+    inference_provider = (
+        selection.provider.inference_providers.get(selection.model)
+        if isinstance(selection.provider, OpenAICompatibleProviderConfig)
+        and selection.provider.name == "huggingface"
+        else None
+    )
+    return _create_print_session(
+        manager,
+        cwd=cwd,
+        model=selection.model,
+        provider_name=selection.provider.name,
+        inference_provider=inference_provider,
+        session_id=session_id,
+    )
+
+
+def _create_print_session(
+    manager: SessionManager,
+    *,
+    cwd: Path,
+    model: str,
+    provider_name: str | None = None,
+    inference_provider: str | None = None,
+    session_id: str | None = None,
+) -> CodingSessionRecord:
+    """Create an isolated print-mode session, refusing transcript collisions."""
+    return manager.create_session_exclusive(
+        cwd=cwd,
+        model=model,
+        provider_name=provider_name,
+        inference_provider=inference_provider,
+        session_id=session_id,
+    )
 
 
 async def run_print_mode(
@@ -701,12 +902,18 @@ async def run_print_mode(
     session_id: str | None = None,
     session_manager: SessionManager | None = None,
     provider_name: str = DEFAULT_PROVIDER_NAME,
+    inference_provider: str | None = None,
     provider_settings: ProviderSettings | None = None,
     runtime_provider_config: ProviderConfig | None = None,
     shell_command_prefix: str | None = None,
     extension_paths: tuple[Path, ...] = (),
     extensions_enabled: bool = True,
     project_extensions_enabled: bool = False,
+    custom_system_prompt: str | None = None,
+    append_system_prompt: str | None = None,
+    trust_override: TrustOverride | None = None,
+    trust_default: TrustDefault = "ask",
+    startup_model_override: bool = False,
 ) -> bool:
     """Run one non-interactive prompt and print streamed events.
 
@@ -723,15 +930,25 @@ async def run_print_mode(
             session_id=session_id,
             session_manager=session_manager,
             provider_name=provider_name,
+            inference_provider=inference_provider,
             provider_settings=provider_settings,
             runtime_provider_config=runtime_provider_config,
             shell_command_prefix=shell_command_prefix,
             extension_paths=extension_paths,
             extensions_enabled=extensions_enabled,
             project_extensions_enabled=project_extensions_enabled,
+            custom_system_prompt=custom_system_prompt,
+            append_system_prompt=append_system_prompt,
+            trust_override=trust_override,
+            trust_default=trust_default,
         )
     )
+    if startup_model_override:
+        await session.apply_startup_model_override(model)
     session.extension_runtime.set_ui_bridge(StderrUiBridge())
+    for diagnostic in session.resource_diagnostics:
+        if diagnostic.kind == "project-trust":
+            typer.echo(diagnostic.format(), err=True)
     await session.emit_pending_session_start()
     renderer = create_event_renderer(
         output,

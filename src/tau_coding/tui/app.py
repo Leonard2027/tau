@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal, Protocol, TypeVar, cast
 
 from rich.console import Console, Group
+from rich.style import Style
 from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
@@ -23,7 +24,6 @@ from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.events import Key, Resize
 from textual.screen import ModalScreen
-from textual.theme import Theme
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
@@ -76,6 +76,8 @@ from tau_coding.events import (
     AgentSettledEvent,
     AutoRetryStartEvent,
     CodingSessionEvent,
+    CompactionEndEvent,
+    CompactionStartEvent,
     QueueUpdateEvent,
 )
 from tau_coding.extensions.api import (
@@ -95,6 +97,7 @@ from tau_coding.oauth_types import (
     OAuthPrompt,
     OAuthSelectPrompt,
 )
+from tau_coding.project_trust import ProjectTrustRequest, TrustChoice, TrustOverride
 from tau_coding.prompt_templates import PromptTemplate
 from tau_coding.provider_catalog import (
     BUILTIN_PROVIDER_CATALOG,
@@ -115,7 +118,7 @@ from tau_coding.provider_config import (
     upsert_saved_provider,
 )
 from tau_coding.provider_runtime import create_model_provider
-from tau_coding.resources import TauResourcePaths
+from tau_coding.resources import ResourceDiagnostic, TauResourcePaths
 from tau_coding.session import (
     TREE_RUNNING_MESSAGE,
     CodingSession,
@@ -147,14 +150,16 @@ from tau_coding.tui.config import (
     save_tui_settings,
 )
 from tau_coding.tui.file_drop import normalize_dropped_paths
+from tau_coding.tui.project_trust import ProjectTrustScreen, prompt_project_trust
 from tau_coding.tui.state import TuiState, format_terminal_command_result_block
 from tau_coding.tui.terminal_notification import TerminalNotificationController
 from tau_coding.tui.terminal_title import TerminalTitleController
 from tau_coding.tui.themes import (
     available_tui_theme_names,
-    get_tui_theme,
     load_custom_tui_themes,
     set_custom_tui_themes,
+    textual_theme_for_tui_theme,
+    theme_css_variables,
 )
 from tau_coding.tui.widgets import (
     CompactSessionInfo,
@@ -163,6 +168,9 @@ from tau_coding.tui.widgets import (
     _custom_markup_to_text,
     render_completion_suggestions,
 )
+
+_textual_theme_for_tau_theme = textual_theme_for_tui_theme
+_theme_css_variables = theme_css_variables
 
 type BindingEntry = Binding | tuple[str, str] | tuple[str, str, str]
 SIDEBAR_MIN_WIDTH = 96
@@ -198,9 +206,10 @@ class LoginRequiredProvider:
         messages: list[AgentMessage],
         tools: list[AgentTool],
         signal: CancellationToken | None = None,
+        session_id: str | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
         """Surface a login-needed provider error."""
-        del system, messages, tools, signal
+        del system, messages, tools, signal, session_id
 
         async def iterator() -> AsyncIterator[AssistantMessageEvent]:
             error = AssistantMessage(
@@ -590,15 +599,15 @@ class PromptInput(TextArea):
             self._clear_pending_paste()
 
     def get_line(self, line_index: int) -> Text:
-        """Retrieve one prompt line with shell prefixes highlighted."""
+        """Retrieve one prompt line, coloring terminal commands like a running tool."""
         line = super().get_line(line_index)
-        if line_index != 0 or not self.shell_mode_style:
+        if not self.shell_mode_style:
             return line
         span = _terminal_command_prefix_span(self.text)
         if span is None:
             return line
-        start, end = span
-        line.stylize(self.shell_mode_style, start, end)
+        start, _ = span
+        line.stylize(self.shell_mode_style, start if line_index == 0 else 0)
         return line
 
     async def action_submit_follow_up(self) -> None:
@@ -632,17 +641,34 @@ class PromptInput(TextArea):
         as a paste; when the pasted text is only existing file paths, insert the
         normalized paths instead of the raw (possibly escaped) drop text.
         """
-        dropped_paths = normalize_dropped_paths(event.text)
-        if dropped_paths is not None:
+        if self.handle_pasted_text(event.text):
             event.stop()
             event.prevent_default()
+
+    def handle_pasted_text(self, text: str) -> bool:
+        """Apply Tau's paste rules to *text*.
+
+        Returns ``True`` when the text was inserted here (file drop or large
+        paste placeholder) and ``False`` when it should be inserted verbatim by
+        the caller (or by Textual's default paste handling).
+        """
+        dropped_paths = normalize_dropped_paths(text)
+        if dropped_paths is not None:
             self._insert_dropped_paths(dropped_paths)
-            return
-        if len(event.text) <= PASTE_DISPLAY_THRESHOLD:
-            return
-        event.stop()
-        event.prevent_default()
-        self._show_large_paste_placeholder(event.text)
+            return True
+        if len(text) <= PASTE_DISPLAY_THRESHOLD:
+            return False
+        self._show_large_paste_placeholder(text)
+        return True
+
+    def insert_pasted_text(self, text: str) -> None:
+        """Insert pasted text that Textual could not deliver to this widget.
+
+        Used for drops that arrive while the terminal is unfocused, where no
+        default paste handler runs, so verbatim insertion is done here.
+        """
+        if not self.handle_pasted_text(text):
+            self.insert(text)
 
     def _insert_dropped_paths(self, insertion: str) -> None:
         """Insert dropped paths at the cursor, separated from surrounding text."""
@@ -1171,7 +1197,15 @@ class SessionPickerSearchInput(Input):
         self._picker().action_cancel()
 
 
-class PromptTemplatePickerScreen(ModalScreen[str | None]):
+@dataclass(frozen=True, slots=True)
+class PromptTemplatePickerResult:
+    """Action selected from the prompt-template picker."""
+
+    action: Literal["insert", "edit"]
+    template: PromptTemplate
+
+
+class PromptTemplatePickerScreen(ModalScreen[PromptTemplatePickerResult | None]):
     """Searchable picker for loaded prompt templates."""
 
     BINDINGS: ClassVar[list[BindingEntry]] = [
@@ -1179,6 +1213,7 @@ class PromptTemplatePickerScreen(ModalScreen[str | None]):
         Binding("up", "cursor_up", "Up", show=False),
         Binding("down", "cursor_down", "Down", show=False),
         Binding("enter", "select_cursor", "Select", show=False),
+        Binding("ctrl+e", "edit_cursor", "Edit", show=False, priority=True),
     ]
 
     def __init__(self, templates: Sequence[PromptTemplate]) -> None:
@@ -1227,12 +1262,25 @@ class PromptTemplatePickerScreen(ModalScreen[str | None]):
         self.query_one("#prompt-template-picker-list", ListView).action_cursor_down()
 
     def action_select_cursor(self) -> None:
-        picker_list = self.query_one("#prompt-template-picker-list", ListView)
-        if self.visible_templates and picker_list.index is not None:
-            self.dismiss(self.visible_templates[picker_list.index].name)
+        template = self._selected_template()
+        if template is not None:
+            self.dismiss(PromptTemplatePickerResult(action="insert", template=template))
+
+    def action_edit_cursor(self) -> None:
+        """Open the selected template in Tau's prompt editor."""
+        template = self._selected_template()
+        if template is not None:
+            self.dismiss(PromptTemplatePickerResult(action="edit", template=template))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    def _selected_template(self) -> PromptTemplate | None:
+        picker_list = self.query_one("#prompt-template-picker-list", ListView)
+        index = picker_list.index
+        if index is None or index >= len(self.visible_templates):
+            return None
+        return self.visible_templates[index]
 
     def _refresh_list(self) -> None:
         picker_list = self.query_one("#prompt-template-picker-list", ListView)
@@ -1248,12 +1296,46 @@ class PromptTemplatePickerScreen(ModalScreen[str | None]):
         )
         picker_list.index = 0 if self.visible_templates else None
         if self.visible_templates:
-            help_text = "Enter selects - Escape closes"
+            help_text = "Enter inserts - Ctrl+E edits - Escape closes"
         elif self.templates:
             help_text = "No matching prompt templates - Escape closes"
         else:
             help_text = "No prompt templates loaded - Escape closes"
         self.query_one("#prompt-template-picker-help", Static).update(help_text)
+
+
+class PromptTemplateEditorScreen(ModalScreen[str | None]):
+    """Edit one prompt-template Markdown file inside the TUI."""
+
+    BINDINGS: ClassVar[list[BindingEntry]] = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+s", "save", "Save", show=False, priority=True),
+    ]
+
+    def __init__(self, template: PromptTemplate, source: str) -> None:
+        super().__init__()
+        self.template = template
+        self.source = source
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="prompt-template-editor"):
+            yield Static(f"Edit /{self.template.name}", id="prompt-template-editor-title")
+            yield Static(str(self.template.path), id="prompt-template-editor-path")
+            yield TextArea(self.source, id="prompt-template-editor-input")
+            yield Static(
+                "Ctrl+S saves - Escape returns without saving",
+                id="prompt-template-editor-help",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#prompt-template-editor-input", TextArea).focus()
+
+    def action_save(self) -> None:
+        source = self.query_one("#prompt-template-editor-input", TextArea).text
+        self.dismiss(source)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class SessionPickerScreen(ModalScreen[str | None]):
@@ -2764,12 +2846,31 @@ class OAuthLoginScreen(ModalScreen[OAuthCredential | _LoginFlowAction | None]):
         self.dismiss(credential)
 
     def _show_auth(self, info: OAuthAuthInfo) -> None:
-        self.query_one("#login-oauth-url", Static).update(info.url)
+        self._show_url(info.url)
+        # Copy only the browser-flow URL. It is hundreds of characters long and
+        # wraps across the dialog, so hand-selecting it is what corrupts it;
+        # taking over the clipboard is worth it there and nowhere else.
+        with suppress(Exception):
+            self.app.copy_to_clipboard(info.url)
+        self.notify("Authorization URL copied to clipboard.")
         if info.instructions:
             self.query_one("#login-help", Static).update(info.instructions)
 
+    def _show_url(self, url: str) -> None:
+        """Display a URL as one clickable unit.
+
+        Authorization URLs are far wider than the dialog, so they render across
+        several wrapped lines. Selecting those lines by hand tends to corrupt
+        the URL — a query parameter split across a wrap picks up the line break
+        or trailing padding and the provider rejects the request. An OSC 8
+        hyperlink keeps a click on any wrapped line opening the intact URL.
+        """
+        self.query_one("#login-oauth-url", Static).update(Text(url, style=Style(link=url)))
+
     def _show_device_code(self, info: OAuthDeviceCodeInfo) -> None:
-        self.query_one("#login-oauth-url", Static).update(info.verification_uri)
+        # No clipboard copy here: the verification URI is short and clickable,
+        # and the thing the user carries to the browser is the code below it.
+        self._show_url(info.verification_uri)
         self.query_one("#login-help", Static).update(
             f"Open the URL and enter code: {info.user_code}"
         )
@@ -2873,8 +2974,13 @@ class TauTuiApp(App[None]):
         border: none;
     }
 
-    #sidebar-content {
+    #sidebar-scroll {
         height: 1fr;
+        scrollbar-size-vertical: 1;
+    }
+
+    #sidebar-content {
+        height: auto;
     }
 
     #sidebar-brand {
@@ -2978,7 +3084,7 @@ class TauTuiApp(App[None]):
     }
 
     #prompt.-shell-mode {
-        border-left: tall $tau-accent;
+        border-left: tall $tau-tool-running;
     }
 
     #compact-session-info {
@@ -3002,6 +3108,7 @@ class TauTuiApp(App[None]):
 
     SessionPickerScreen,
     PromptTemplatePickerScreen,
+    PromptTemplateEditorScreen,
     SkillPickerScreen,
     TreePickerScreen,
     ToolsReferenceScreen,
@@ -3011,6 +3118,7 @@ class TauTuiApp(App[None]):
 
     #session-picker,
     #prompt-template-picker,
+    #prompt-template-editor,
     #skill-picker,
     #tree-picker,
     #tools-reference {
@@ -3025,6 +3133,7 @@ class TauTuiApp(App[None]):
 
     #session-picker-title,
     #prompt-template-picker-title,
+    #prompt-template-editor-title,
     #skill-picker-title,
     #tree-picker-title,
     #tools-reference-title {
@@ -3049,6 +3158,23 @@ class TauTuiApp(App[None]):
         height: 1;
         color: $tau-muted-text;
         text-style: bold;
+    }
+
+    #prompt-template-editor {
+        height: 80%;
+    }
+
+    #prompt-template-editor-path {
+        height: 1;
+        margin-bottom: 1;
+        color: $tau-muted-text;
+    }
+
+    #prompt-template-editor-input {
+        height: 1fr;
+        background: $tau-prompt-background;
+        color: $tau-prompt-text;
+        border: tall $tau-prompt-border;
     }
 
     #session-picker-list,
@@ -3092,6 +3218,7 @@ class TauTuiApp(App[None]):
 
     #session-picker-help,
     #prompt-template-picker-help,
+    #prompt-template-editor-help,
     #skill-picker-help,
     #tree-picker-help,
     #tools-reference-help {
@@ -3102,8 +3229,13 @@ class TauTuiApp(App[None]):
 
     ExtensionSelectScreen,
     ExtensionConfirmScreen,
-    ExtensionInputScreen {
+    ExtensionInputScreen,
+    ProjectTrustScreen {
         align: center middle;
+    }
+
+    ProjectTrustScreen {
+        background: $tau-screen-background 60%;
     }
 
     #extension-select,
@@ -3152,6 +3284,40 @@ class TauTuiApp(App[None]):
         height: 1;
         margin-top: 1;
         color: $tau-muted-text;
+    }
+
+    #project-trust-dialog {
+        width: 76;
+        max-width: 92%;
+        height: auto;
+        max-height: 90%;
+        padding: 1 2;
+        background: $tau-chrome-background;
+        color: $tau-chrome-text;
+        border: tall $tau-border;
+    }
+
+    #project-trust-title {
+        color: $tau-chrome-text;
+    }
+
+    #project-trust-path-label,
+    #project-trust-summary-label,
+    #project-trust-boundary,
+    #project-trust-help {
+        color: $tau-muted-text;
+    }
+
+    #project-trust-list {
+        background: $tau-transcript-background;
+        color: $tau-screen-text;
+        border: tall $tau-border;
+    }
+
+    #project-trust-list ListItem.-highlight,
+    #project-trust-list ListItem.-highlight Label {
+        background: $tau-highlight-background;
+        color: $tau-highlight-text;
     }
 
     #command-output {
@@ -3292,6 +3458,12 @@ class TauTuiApp(App[None]):
         width: 72;
         max-width: 92%;
         height: auto;
+        /* A wrapped authorization URL makes this dialog taller than a short
+           terminal. Cap it at the screen and scroll instead of overflowing:
+           overflowing centers the excess, which pushes the paste field and
+           the footer off the bottom and the title off the top. */
+        max-height: 100%;
+        overflow-y: auto;
         padding: 1 2;
         background: $tau-chrome-background;
         border: tall $tau-border;
@@ -3327,8 +3499,11 @@ class TauTuiApp(App[None]):
     }
 
     #login-oauth-url {
+        /* Authorization URLs run ~470 chars (Anthropic); clipping them means a
+           user copying the URL out of the TUI loses the trailing query
+           parameters and the provider rejects the request. Keep every line. */
         min-height: 1;
-        max-height: 4;
+        height: auto;
         color: $tau-chrome-text;
         margin-bottom: 1;
     }
@@ -3348,6 +3523,7 @@ class TauTuiApp(App[None]):
         startup_message: str | None = None,
         startup_notice: str | None = None,
         startup_update_notice: str | None = None,
+        startup_alerts: Sequence[str] = (),
         startup_notices: Sequence[str] = (),
         initial_prompt: str | None = None,
     ) -> None:
@@ -3370,6 +3546,8 @@ class TauTuiApp(App[None]):
         self.state = TuiState(skills=session.skills)
         if startup_update_notice is not None:
             self.state.add_item("status", startup_update_notice, highlight="update")
+        for alert in startup_alerts:
+            self.state.add_item("status", alert, highlight="alert")
         for notice in self.startup_notices:
             self.state.add_item("status", notice)
         if self.tui_settings.theme != self.tui_settings.resolved_theme.name:
@@ -3403,6 +3581,8 @@ class TauTuiApp(App[None]):
         self._connect_extension_runtime(session)
         self._prompt_worker: Worker[None] | None = None
         self._compaction_worker: Worker[None] | None = None
+        self._compacting = False
+        self._compaction_run_id = 0
         self._prompt_run_id = 0
         self._optimistic_user_messages: list[tuple[int, str]] = []
         self._completion_state = CompletionState()
@@ -3421,15 +3601,23 @@ class TauTuiApp(App[None]):
         self._supports_pyperclip: bool | None = None
         self._sync_session_title()
 
+    async def prompt_project_trust(self, request: ProjectTrustRequest) -> TrustChoice | None:
+        """Resolve a trust request through the active Textual modal stack."""
+        return await self.push_screen_wait(ProjectTrustScreen(request))
+
     def _sync_session_title(self) -> None:
         """Reflect the active session name in the terminal tab title."""
         self._sync_terminal_title()
+
+    def _is_working(self) -> bool:
+        """Return whether the app should show working affordances (agent turn or compaction)."""
+        return self.state.running or self._compacting
 
     def _sync_terminal_title(self) -> None:
         """Reflect the active session name and running state in the terminal tab title."""
         self._terminal_title.update(
             getattr(self.session, "session_title", None),
-            running=self.state.running,
+            running=self._is_working(),
             frame=self._activity_frame,
         )
 
@@ -3466,6 +3654,47 @@ class TauTuiApp(App[None]):
         self._registered_themes.clear()
         for theme_name in available_tui_theme_names():
             self.register_theme(_textual_theme_for_tau_theme(theme_name))
+
+    def _reload_session_themes(self) -> None:
+        """Rebind custom themes to the active session's accepted trust snapshot."""
+        theme_dirs = getattr(self.session, "theme_dirs", None)
+        if theme_dirs is None:
+            trust_resolution = getattr(self.session, "project_trust_resolution", None)
+            trusted = trust_resolution is None or trust_resolution.trusted
+            theme_dirs = TauResourcePaths(
+                cwd=self.session.cwd,
+                project_resources_enabled=trusted,
+            ).themes_dirs
+        try:
+            custom_themes, diagnostics = load_custom_tui_themes(theme_dirs)
+        except (OSError, RuntimeError) as exc:
+            # Theme discovery must fail closed after a trust/cwd transition:
+            # never retain themes from the previous project snapshot.
+            custom_themes = {}
+            diagnostics = []
+            self._notify(f"Could not reload custom themes: {exc}", severity="error")
+
+        set_custom_tui_themes(custom_themes)
+        self._register_tau_textual_themes()
+        resolved_theme = self.tui_settings.resolved_theme.name
+        self._applying_settings_theme = True
+        try:
+            if self.theme == resolved_theme:
+                # Re-apply CSS when a same-named custom theme changed in place.
+                self._watch_theme(resolved_theme)
+            else:
+                self.theme = resolved_theme
+        finally:
+            self._applying_settings_theme = False
+        for diagnostic in diagnostics:
+            severity: Literal["information", "warning", "error"] = (
+                "error"
+                if diagnostic.severity == "error"
+                else "warning"
+                if diagnostic.severity == "warning"
+                else "information"
+            )
+            self._notify(diagnostic.format(), severity=severity)
 
     def _watch_theme(self, theme_name: str) -> None:
         """Keep Textual theme changes synchronized with Tau's durable TUI theme."""
@@ -3516,7 +3745,7 @@ class TauTuiApp(App[None]):
     async def on_mount(self) -> None:
         """Focus the prompt when the app starts."""
         prompt = self.query_one(PromptInput)
-        prompt.shell_mode_style = self.tui_settings.resolved_theme.accent
+        prompt.shell_mode_style = self.tui_settings.resolved_theme.role_styles["tool"].border
         self._sync_prompt_shell_mode(prompt.text)
         prompt.focus()
         self._update_responsive_layout(self.size.width, self.size.height)
@@ -3581,6 +3810,27 @@ class TauTuiApp(App[None]):
     def on_app_focus(self) -> None:
         """Suppress turn notifications while the Tau terminal surface is active."""
         self._app_has_focus = True
+
+    def on_paste(self, event: events.Paste) -> None:
+        """Route pastes that arrive while no widget holds keyboard focus.
+
+        Textual clears widget focus whenever the terminal reports lost focus
+        (``CSI ? 1004 h``), and pastes are dropped when nothing is focused. OS
+        drag-and-drop from sources that never hand focus back to the terminal --
+        notably the macOS Dock -- delivers the dropped paths in exactly that
+        state, so the paste bubbles up here instead of reaching the prompt.
+        Clipboard pastes always require terminal focus, so this only reroutes
+        drops that would otherwise be silently discarded.
+        """
+        if self.focused is not None:
+            return
+        try:
+            prompt = self.screen.query_one("#prompt", PromptInput)
+        except NoMatches:
+            # A modal screen owns the input; leave its own handling alone.
+            return
+        event.stop()
+        prompt.insert_pasted_text(event.text)
 
     def on_resize(self, event: Resize) -> None:
         """Update responsive chrome when the terminal changes size."""
@@ -3681,6 +3931,7 @@ class TauTuiApp(App[None]):
                     terminal_command.command,
                     add_to_context=terminal_command.add_to_context,
                 ),
+                group="terminal-command",
                 exclusive=True,
             )
             return
@@ -3695,6 +3946,7 @@ class TauTuiApp(App[None]):
                 except ValueError as exc:
                     command = replace(command, message=f"Could not reload: {exc}")
                 else:
+                    self._reload_session_themes()
                     command = replace(command, message=format_reload_summary(summary))
             if command.new_session_requested:
                 await self._new_session()
@@ -3721,7 +3973,10 @@ class TauTuiApp(App[None]):
                         command.export_destination,
                         format=command.export_format,
                     )
-                    self._notify(f"Exported session to {exported_path}")
+                    self._append_command_message(
+                        text,
+                        f"Exported session to {exported_path}",
+                    )
                 except Exception as exc:  # noqa: BLE001 - surface command failures in the TUI
                     self._notify(f"Could not export session: {exc}", severity="error")
             if command.resume_session_id is not None:
@@ -3800,7 +4055,9 @@ class TauTuiApp(App[None]):
     def _is_compaction_active(self) -> bool:
         """Return whether a manual compaction worker is still running."""
         worker = self._compaction_worker
-        return worker is not None and not worker.is_finished and not worker.is_cancelled
+        if worker is not None and not worker.is_finished and not worker.is_cancelled:
+            return True
+        return self._compacting
 
     def _is_agent_or_queue_active(self) -> bool:
         """Return whether compaction would race an active or queued agent turn."""
@@ -3817,10 +4074,13 @@ class TauTuiApp(App[None]):
 
     async def _run_compaction(self, summary: str) -> None:
         """Run manual compaction without disabling prompt editing."""
-        self.state.clear()
-        self.state.add_item("status", "Compacting session…")
-        self._refresh()
+        self._compaction_run_id += 1
+        run_id = self._compaction_run_id
+        self._compacting = True
         try:
+            self.state.clear()
+            self.state.add_item("status", "Compacting session…")
+            self._refresh()
             compact_message = await self.session.compact(summary)
         except asyncio.CancelledError:
             return
@@ -3828,12 +4088,19 @@ class TauTuiApp(App[None]):
             self._notify(f"Error: {exc}", severity="error")
             return
         finally:
-            self._compaction_worker = None
+            # A cancelled run can tear down after a newer compaction started, so only
+            # clear working state this run still owns.
+            if self._compaction_run_id == run_id:
+                self._compacting = False
+                self._compaction_worker = None
+                self._refresh_chrome_if_mounted()
         self.state.clear()
         self.state.set_skills(self.session.skills)
         self._load_session_messages_from_session()
         self._notify(compact_message)
         self._refresh()
+        if not self._app_has_focus:
+            self._terminal_notification.notify_turn_finished()
 
     async def _submit_prompt(
         self,
@@ -4541,6 +4808,12 @@ class TauTuiApp(App[None]):
                 ):
                     _attach_diagnostic_log_path_to_error(self.state, self.session)
                     _attach_retry_hint_to_error(self.state, event.message)
+                elif (
+                    isinstance(event, CompactionEndEvent)
+                    and event.reason == "overflow"
+                    and (event.aborted or event.error_message)
+                ):
+                    _attach_diagnostic_log_path_to_error(self.state, self.session)
                 await self._apply_streaming_transcript_event(event)
                 if isinstance(event, AgentSettledEvent) and not self._app_has_focus:
                     self._terminal_notification.notify_turn_finished()
@@ -4634,13 +4907,23 @@ class TauTuiApp(App[None]):
             return
         if isinstance(event, ToolExecutionStartEvent):
             await transcript.finish_assistant_message()
-            item = self.state.items[-1]
-            await transcript.append_item(
-                item,
-                theme=theme,
-                show_tool_results=self.state.show_tool_results,
-                invocation=self.state.resolve_tool_invocation(item),
-            )
+            item = self.state.find_tool_item(event.tool_call_id)
+            if item is not None:
+                expanded = self.state.show_tool_results or item.always_show_tool_result
+                updated = await transcript.update_item(
+                    item,
+                    theme=theme,
+                    show_tool_results=expanded,
+                    invocation=self.state.resolve_tool_invocation(item, expanded=expanded),
+                    result_markup=self.state.resolve_tool_result(item, expanded=expanded),
+                )
+                if not updated:
+                    await transcript.append_item(
+                        item,
+                        theme=theme,
+                        show_tool_results=expanded,
+                        invocation=self.state.resolve_tool_invocation(item, expanded=expanded),
+                    )
             self._refresh_chrome()
             return
         if isinstance(event, ToolExecutionUpdateEvent):
@@ -4652,20 +4935,28 @@ class TauTuiApp(App[None]):
                     updated_item,
                     theme=theme,
                     show_tool_results=expanded,
-                    invocation=self.state.resolve_tool_invocation(updated_item),
+                    invocation=self.state.resolve_tool_invocation(updated_item, expanded=expanded),
                     result_markup=self.state.resolve_tool_result(updated_item, expanded=expanded),
                 )
             self._refresh_chrome()
             return
-        if isinstance(event, AutoRetryStartEvent):
+        if isinstance(event, (AutoRetryStartEvent, CompactionStartEvent)):
             await transcript.finish_assistant_message()
-            if self.state.items:
+            if self.state.items and (
+                isinstance(event, AutoRetryStartEvent) or event.reason == "overflow"
+            ):
                 await transcript.append_item(
                     self.state.items[-1],
                     theme=theme,
                     show_tool_results=self.state.show_tool_results,
                 )
             self._refresh_chrome()
+            return
+        if isinstance(event, CompactionEndEvent):
+            if event.reason == "overflow" and (event.aborted or event.error_message):
+                self._refresh()
+            else:
+                self._refresh_chrome()
             return
         if isinstance(event, ToolExecutionEndEvent):
             updated_item = self.state.find_tool_item(event.tool_call_id)
@@ -4675,7 +4966,7 @@ class TauTuiApp(App[None]):
                     updated_item,
                     theme=theme,
                     show_tool_results=expanded,
-                    invocation=self.state.resolve_tool_invocation(updated_item),
+                    invocation=self.state.resolve_tool_invocation(updated_item, expanded=expanded),
                     result_markup=self.state.resolve_tool_result(updated_item, expanded=expanded),
                 )
             self._refresh_chrome()
@@ -4698,7 +4989,9 @@ class TauTuiApp(App[None]):
             return False
 
         worker.cancel()
+        self._compaction_run_id += 1
         self._compaction_worker = None
+        self._compacting = False
         self.state.clear()
         self.state.set_skills(self.session.skills)
         self._load_session_messages_from_session()
@@ -4748,7 +5041,8 @@ class TauTuiApp(App[None]):
             | LoginProviderPickerScreen
             | ThemePickerScreen
             | ExtensionSelectScreen
-            | ExtensionConfirmScreen,
+            | ExtensionConfirmScreen
+            | ProjectTrustScreen,
         ):
             self.screen.action_select_cursor()
             return
@@ -4763,6 +5057,9 @@ class TauTuiApp(App[None]):
 
     def action_completion_next(self) -> None:
         """Select the next prompt completion or move down in the prompt."""
+        if isinstance(self.screen, PromptTemplateEditorScreen):
+            self.screen.query_one("#prompt-template-editor-input", TextArea).action_cursor_down()
+            return
         if isinstance(self.screen, CommandOutputScreen):
             self.screen.action_scroll_down()
             return
@@ -4778,7 +5075,8 @@ class TauTuiApp(App[None]):
             | ModelPickerScreen
             | ToolsReferenceScreen
             | ExtensionSelectScreen
-            | ExtensionConfirmScreen,
+            | ExtensionConfirmScreen
+            | ProjectTrustScreen,
         ):
             self.screen.action_cursor_down()
             return
@@ -4790,6 +5088,9 @@ class TauTuiApp(App[None]):
 
     def action_completion_previous(self) -> None:
         """Select the previous prompt completion or move up in the prompt."""
+        if isinstance(self.screen, PromptTemplateEditorScreen):
+            self.screen.query_one("#prompt-template-editor-input", TextArea).action_cursor_up()
+            return
         if isinstance(self.screen, CommandOutputScreen):
             self.screen.action_scroll_up()
             return
@@ -4805,7 +5106,8 @@ class TauTuiApp(App[None]):
             | ModelPickerScreen
             | ToolsReferenceScreen
             | ExtensionSelectScreen
-            | ExtensionConfirmScreen,
+            | ExtensionConfirmScreen
+            | ProjectTrustScreen,
         ):
             self.screen.action_cursor_up()
             return
@@ -4900,16 +5202,60 @@ class TauTuiApp(App[None]):
             callback=self._handle_prompt_template_picker_result,
         )
 
-    def _handle_prompt_template_picker_result(self, name: str | None) -> None:
+    def _handle_prompt_template_picker_result(
+        self, result: PromptTemplatePickerResult | None
+    ) -> None:
         prompt = self.query_one("#prompt", PromptInput)
         prompt.focus()
-        if name is None:
+        if result is None:
             return
-        invocation = f"/{name}"
+        if result.action == "edit":
+            try:
+                source = result.template.path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                self._notify(f"Could not read /{result.template.name}: {exc}", severity="error")
+                self._open_prompt_template_picker()
+                return
+            self.push_screen(
+                PromptTemplateEditorScreen(result.template, source),
+                callback=lambda edited: self._handle_prompt_template_edit(result.template, edited),
+            )
+            return
+        invocation = f"/{result.template.name}"
         prompt.text = invocation
         prompt.move_cursor(_text_end_location(invocation))
         self._completion_state = self._build_completion_state(invocation)
         self._refresh_completions()
+
+    def _handle_prompt_template_edit(self, template: PromptTemplate, source: str | None) -> None:
+        if source is None:
+            self._open_prompt_template_picker()
+            return
+        self.run_worker(self._save_prompt_template_edit(template, source), exclusive=False)
+
+    async def _save_prompt_template_edit(self, template: PromptTemplate, source: str) -> None:
+        try:
+            template.path.write_text(source, encoding="utf-8")
+        except OSError as exc:
+            self._notify(f"Could not save /{template.name}: {exc}", severity="error")
+            self._open_prompt_template_picker()
+            return
+
+        try:
+            reload_result = self.session.reload()
+            if isawaitable(reload_result):
+                await reload_result
+        except Exception as exc:  # noqa: BLE001 - saved file remains valid; surface reload errors
+            self._notify(
+                f"Saved /{template.name}, but could not reload resources: {exc}",
+                severity="error",
+            )
+        else:
+            self.state.set_skills(self.session.skills)
+            self._completion_state = self._build_completion_state("")
+            self._refresh()
+            self._notify(f"Saved /{template.name} and reloaded resources.")
+        self._open_prompt_template_picker()
 
     def _open_skills_picker(self) -> None:
         """Open loaded-skill discovery."""
@@ -4947,9 +5293,8 @@ class TauTuiApp(App[None]):
 
     def action_toggle_tool_results(self) -> None:
         """Toggle inline tool result details without rebuilding unrelated history."""
-        expanded = self.state.toggle_tool_results()
+        self.state.toggle_tool_results()
         self.run_worker(self._update_tool_results_visibility(), exclusive=False)
-        self._notify("Tool results expanded." if expanded else "Tool results collapsed.")
 
     async def _update_tool_results_visibility(self) -> None:
         transcript = self.query_one("#transcript", TranscriptView)
@@ -4975,6 +5320,7 @@ class TauTuiApp(App[None]):
     async def _resume_session(self, session_id: str) -> None:
         try:
             resume_message = await self.session.resume(session_id)
+            self._reload_session_themes()
             self.state.clear()
             self.state.set_skills(self.session.skills)
             self._load_session_messages_from_session()
@@ -5067,6 +5413,7 @@ class TauTuiApp(App[None]):
             return
         try:
             await new_session()
+            self._reload_session_themes()
             self.state.clear()
             self.state.set_skills(self.session.skills)
             self._load_session_messages_from_session()
@@ -5552,9 +5899,16 @@ class TauTuiApp(App[None]):
             return
         self.adapter.apply(queue_event())
 
+    def _refresh_chrome_if_mounted(self) -> None:
+        """Refresh chrome when the app is mounted, ignoring teardown races."""
+        if not self.screen_stack:
+            return
+        with suppress(NoMatches):
+            self._refresh_chrome()
+
     def _sync_activity_indicator(self) -> None:
         self._sync_terminal_title()
-        if self.state.running:
+        if self._is_working():
             if self._activity_timer is None:
                 self._activity_timer = self.set_interval(
                     ACTIVITY_TICK_SECONDS,
@@ -5571,7 +5925,7 @@ class TauTuiApp(App[None]):
         self._apply_activity_indicator()
 
     def _tick_activity(self) -> None:
-        if not self.state.running:
+        if not self._is_working():
             return
         self._activity_frame += 1
         self._apply_activity_indicator()
@@ -5604,7 +5958,7 @@ class TauTuiApp(App[None]):
             item,
             theme=self.tui_settings.resolved_theme,
             show_tool_results=expanded,
-            invocation=self.state.resolve_tool_invocation(item),
+            invocation=self.state.resolve_tool_invocation(item, expanded=expanded),
             result_markup=self.state.resolve_tool_result(item, expanded=expanded),
         )
 
@@ -5622,7 +5976,7 @@ class TauTuiApp(App[None]):
             theme.screen_background,
             theme.prompt_border,
             self._activity_frame,
-            self.state.running,
+            self._is_working(),
             shell_mode,
         )
         if render_key == self._last_activity_indicator_key:
@@ -5633,7 +5987,7 @@ class TauTuiApp(App[None]):
             _activity_prompt_border_color(
                 theme,
                 frame=self._activity_frame,
-                running=self.state.running,
+                running=self._is_working(),
                 shell_mode=shell_mode,
             ),
         )
@@ -5641,7 +5995,8 @@ class TauTuiApp(App[None]):
             _render_activity_indicator(
                 theme,
                 frame=self._activity_frame,
-                running=self.state.running,
+                running=self._is_working(),
+                shell_mode=shell_mode,
             ),
             layout=False,
         )
@@ -5746,11 +6101,13 @@ class TauTuiApp(App[None]):
 
     def _refresh_footer_bindings(self) -> None:
         prompt = self.query_one("#prompt", PromptInput)
-        prompt.set_footer_mode(_prompt_footer_mode(self.state, self._completion_state))
+        prompt.set_footer_mode(
+            _prompt_footer_mode(self._completion_state, working=self._is_working())
+        )
 
     def _sync_prompt_shell_mode(self, text: str) -> None:
         prompt = self.query_one("#prompt", PromptInput)
-        prompt.shell_mode_style = self.tui_settings.resolved_theme.accent
+        prompt.shell_mode_style = self.tui_settings.resolved_theme.role_styles["tool"].border
         prompt.set_class(_is_terminal_command_prompt(text), "-shell-mode")
         prompt.refresh()
         self._apply_activity_indicator()
@@ -5766,12 +6123,20 @@ def _activity_prompt_border_color(
     """Return the prompt border color for the current activity animation frame."""
     del frame, running
     if shell_mode:
-        return theme.accent
+        return theme.role_styles["tool"].border
     return theme.prompt_border
 
 
-def _render_activity_indicator(theme: TuiTheme, *, frame: int, running: bool) -> Text:
-    """Render the prompt prefix, turning Tau into a moving square while running."""
+def _render_activity_indicator(
+    theme: TuiTheme,
+    *,
+    frame: int,
+    running: bool,
+    shell_mode: bool = False,
+) -> Text:
+    """Render the prompt prefix: a moving square while running, ``$`` in shell mode."""
+    if shell_mode and not running:
+        return Text("$", style=f"bold {theme.role_styles['tool'].border}")
     if not running:
         return Text("τ", style=f"bold {theme.accent}")
 
@@ -6195,61 +6560,6 @@ def _is_thinking_cycle_key(key: str, configured_key: str) -> bool:
     return configured_key == "shift+tab" and key == "backtab"
 
 
-def _textual_theme_for_tau_theme(theme_name: TuiThemeName) -> Theme:
-    """Map a Tau theme to Textual's native theme type."""
-    theme = get_tui_theme(theme_name)
-    return Theme(
-        name=theme.name,
-        primary=theme.accent,
-        secondary=theme.prompt_border,
-        warning=theme.markdown_bullet,
-        error=theme.error,
-        success=theme.success,
-        accent=theme.accent,
-        foreground=theme.screen_text,
-        background=theme.screen_background,
-        surface=theme.chrome_background,
-        panel=theme.sidebar_background,
-        dark=theme.dark,
-        variables=_theme_css_variables(theme),
-    )
-
-
-def _theme_css_variables(theme: TuiTheme) -> dict[str, str]:
-    """Return Textual CSS variables for a resolved Tau theme."""
-    return {
-        "tau-screen-background": theme.screen_background,
-        "tau-screen-text": theme.screen_text,
-        "tau-chrome-background": theme.chrome_background,
-        "tau-chrome-text": theme.chrome_text,
-        "tau-muted-text": theme.muted_text,
-        "tau-sidebar-background": theme.sidebar_background,
-        "tau-border": theme.border,
-        "tau-transcript-background": theme.transcript_background,
-        "tau-prompt-background": theme.prompt_background,
-        "tau-prompt-text": theme.prompt_text,
-        "tau-prompt-border": theme.prompt_border,
-        "tau-autocomplete-background": theme.autocomplete_background,
-        "tau-accent": theme.accent,
-        "tau-highlight-background": theme.highlight_background,
-        "tau-highlight-text": theme.highlight_text,
-        "tau-markdown-highlight": theme.markdown_heading,
-        "tau-markdown-table-header": theme.markdown_table_header,
-        "tau-markdown-table-border": theme.markdown_table_border,
-        "tau-markdown-inline-code": theme.markdown_inline_code,
-        "tau-markdown-code-block-background": theme.markdown_code_block_background,
-        "tau-markdown-link": theme.markdown_link,
-        "tau-markdown-bullet": theme.markdown_bullet,
-        "footer-background": theme.chrome_background,
-        "footer-foreground": theme.chrome_text,
-        "footer-description-background": theme.chrome_background,
-        "footer-description-foreground": theme.chrome_text,
-        "footer-key-background": theme.chrome_background,
-        "footer-key-foreground": theme.accent,
-        "footer-item-background": theme.chrome_background,
-    }
-
-
 def _render_queued_messages(state: TuiState, *, theme: TuiTheme) -> Group:
     """Render queued prompts stacked above the prompt input."""
     rows: list[Text] = []
@@ -6271,12 +6581,13 @@ def _queued_message_preview(message: str) -> str:
 
 
 def _prompt_footer_mode(
-    state: TuiState,
     completion_state: CompletionState,
+    *,
+    working: bool,
 ) -> Literal["normal", "completion", "running"]:
     if completion_state.items:
         return "completion"
-    if state.running:
+    if working:
         return "running"
     return "normal"
 
@@ -6480,15 +6791,27 @@ def _create_startup_session_record(
     *,
     cwd: Path,
     selection: ProviderSelection,
+    inference_provider: str | None = None,
 ) -> CodingSessionRecord:
-    try:
+    if inference_provider is None:
         return manager.prepare_session(
             cwd=cwd,
             model=selection.model,
             provider_name=selection.provider.name,
         )
+    try:
+        return manager.prepare_session(
+            cwd=cwd,
+            model=selection.model,
+            provider_name=selection.provider.name,
+            inference_provider=inference_provider,
+        )
     except TypeError:
-        return manager.prepare_session(cwd=cwd, model=selection.model)
+        return manager.prepare_session(
+            cwd=cwd,
+            model=selection.model,
+            provider_name=selection.provider.name,
+        )
 
 
 def _resolve_tui_startup_selection(
@@ -6578,6 +6901,45 @@ def _usable_scoped_startup_choices(settings: Any) -> tuple[ModelChoice, ...]:
     return tuple(choices)
 
 
+def _resource_conflict_alert(
+    diagnostics: Sequence[ResourceDiagnostic],
+) -> str | None:
+    """Format skill and prompt precedence conflicts as one startup alert."""
+    prefix = "overrides lower-precedence resource at "
+    conflicts = [
+        diagnostic
+        for diagnostic in diagnostics
+        if diagnostic.kind in {"skill", "prompt"}
+        and diagnostic.name is not None
+        and diagnostic.path is not None
+        and diagnostic.message.startswith(prefix)
+    ]
+    if not conflicts:
+        return None
+
+    lines = ["Conflicting skills/prompts detected:"]
+    for diagnostic in conflicts:
+        resource_kind = "skill" if diagnostic.kind == "skill" else "prompt template"
+        shadowed_path = diagnostic.message.removeprefix(prefix)
+        lines.append(
+            f"- {resource_kind} '{diagnostic.name}': {diagnostic.path} overrides {shadowed_path}"
+        )
+    lines.append("Rename or remove duplicate resources to clear this alert.")
+    return "\n".join(lines)
+
+
+def _startup_inference_provider(
+    selection: ProviderSelection,
+    record: CodingSessionRecord | None,
+) -> str | None:
+    provider = selection.provider
+    if not isinstance(provider, OpenAICompatibleProviderConfig) or provider.name != "huggingface":
+        return None
+    if record is not None and record.model == selection.model:
+        return record.inference_provider
+    return provider.inference_providers.get(selection.model)
+
+
 async def run_tui_app(
     *,
     model: str | None,
@@ -6594,6 +6956,9 @@ async def run_tui_app(
     extension_paths: tuple[Path, ...] = (),
     extensions_enabled: bool = True,
     project_extensions_enabled: bool = False,
+    custom_system_prompt: str | None = None,
+    append_system_prompt: str | None = None,
+    trust_override: TrustOverride | None = None,
 ) -> str | None:
     """Run the Textual app and return the active id when its session is persisted."""
     if new_session and session_id is not None:
@@ -6616,10 +6981,12 @@ async def run_tui_app(
     startup_message: str | None = None
     startup_error_notice: str | None = None
     runtime_provider_config: ProviderConfig | None = selection.provider
+    inference_provider = _startup_inference_provider(selection, record)
     try:
         provider = create_model_provider(
             selection.provider,
             model=selection.model,
+            inference_provider=inference_provider,
             thinking_level=resolve_startup_thinking_level(
                 selection.provider,
                 selection.model,
@@ -6647,6 +7014,7 @@ async def run_tui_app(
                 manager,
                 cwd=cwd,
                 selection=selection,
+                inference_provider=inference_provider,
             )
             index_on_first_persist = manager.get_session(record.id) is None
 
@@ -6659,6 +7027,7 @@ async def run_tui_app(
                 session_id=record.id,
                 session_manager=manager,
                 provider_name=selection.provider.name,
+                inference_provider=inference_provider,
                 provider_settings=provider_settings,
                 runtime_provider_config=runtime_provider_config,
                 auto_compact_token_threshold=auto_compact_token_threshold,
@@ -6667,11 +7036,26 @@ async def run_tui_app(
                 extension_paths=extension_paths,
                 extensions_enabled=extensions_enabled,
                 project_extensions_enabled=project_extensions_enabled,
+                custom_system_prompt=custom_system_prompt,
+                append_system_prompt=append_system_prompt,
+                trust_override=trust_override,
+                trust_default=shell_settings.default_project_trust,
+                trust_interactive=True,
+                trust_prompt=prompt_project_trust,
             )
         )
-        custom_themes, theme_diagnostics = load_custom_tui_themes(
-            TauResourcePaths(cwd=record.cwd).themes_dirs
-        )
+        trust_resolution = getattr(session, "project_trust_resolution", None)
+        if trust_resolution is not None and trust_resolution.cancelled:
+            return None
+
+        theme_dirs = getattr(session, "theme_dirs", None)
+        if theme_dirs is None:
+            trusted = trust_resolution is None or trust_resolution.trusted
+            theme_dirs = TauResourcePaths(
+                cwd=record.cwd,
+                project_resources_enabled=trusted,
+            ).themes_dirs
+        custom_themes, theme_diagnostics = load_custom_tui_themes(theme_dirs)
         set_custom_tui_themes(custom_themes)
         legacy_notices = (startup_notice,) if startup_notice else ()
         error_notices = (startup_error_notice,) if startup_error_notice else ()
@@ -6679,14 +7063,22 @@ async def run_tui_app(
         all_startup_notices = tuple(
             (*error_notices, *startup_notices, *legacy_notices, *theme_notices)
         )
+        resource_conflict_alert = _resource_conflict_alert(
+            getattr(session, "resource_diagnostics", ())
+        )
+        startup_alerts = (resource_conflict_alert,) if resource_conflict_alert is not None else ()
         app = TauTuiApp(
             session,
             tui_settings=load_tui_settings(),
             startup_message=startup_message,
             startup_update_notice=startup_update_notice,
+            startup_alerts=startup_alerts,
             startup_notices=all_startup_notices,
             initial_prompt=initial_prompt,
         )
+        set_trust_prompt = getattr(session, "set_project_trust_prompt", None)
+        if set_trust_prompt is not None:
+            set_trust_prompt(app.prompt_project_trust)
         await app.run_async()
     finally:
         if session is not None:

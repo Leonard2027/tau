@@ -24,14 +24,25 @@ command palette with **Ctrl+K**.
 | `/login [provider]` | Connect a built-in provider with OAuth or an API key; Anthropic uses `anthropic-subscription` or `anthropic-api` |
 | `/logout [provider]` | Remove saved credentials for a provider |
 | `/reload` | Reload local skills, prompts, extensions, and project context |
-| `/prompts` | Search loaded prompt templates and insert an invocation for editing |
+| `/prompts` | Search loaded prompt templates; press Enter to insert an invocation or Ctrl+E to edit the file |
 | `/hotkeys` | Show the keyboard shortcuts |
 | `/skills` | Open a searchable picker of loaded skills and insert a selection into the prompt |
 | `/skill:<name> [request]` | Expand a loaded skill into your prompt |
 
+{{% note title="Live HTML exports include the system prompt" %}}
+`/export` includes the current system prompt in a collapsed section when it
+creates HTML. Review it before sharing because it may expose project
+instructions or other local context. JSONL exports do not include the prompt.
+Offline `tau export` from stored JSONL cannot recover it and omits the section.
+The HTML export's **Usage** view charts token and cache activity. Its prompt-input
+chart marks compactions, model and thinking-level changes, and branch summaries
+against the next model request so cache changes have session context.
+{{% /note %}}
+
 {{% note title="`/skill:` is special" %}}
 `/skill:<name>` is a *prompt-expansion* path, not a normal command — Tau expands
-the named skill into your prompt and runs it as a turn. See
+the named skill into your prompt and runs it as a turn. Its optional request may
+start on the same line or on following lines. See
 [Skills & prompt templates]({{< relref "../guides/skills-and-prompts.md" >}}).
 {{% /note %}}
 
@@ -43,4 +54,4 @@ Related:
 
 - **Thinking mode** is keyboard-driven, not a slash command — see
   [Keyboard shortcuts]({{< relref "./keybindings.md" >}}) and [Managing context]({{< relref "../guides/context.md#thinking-modes" >}}).
-- **Prompt templates** use slash invocations (for example, `/wt …`). Use `/prompts` to search loaded templates and insert an invocation without submitting it.
+- **Prompt templates** use slash invocations (for example, `/wt …`). Use `/prompts` to search loaded templates, insert an invocation without submitting it, or edit a selected template with **Ctrl+E**.

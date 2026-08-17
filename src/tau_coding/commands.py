@@ -424,6 +424,7 @@ def _status_command(context: CommandContext) -> CommandResult:
     context_usage = getattr(session, "context_usage", None)
     lines = [
         f"Model: {session.model}",
+        f"Provider: {session.provider_name}",
         f"CWD: {session.cwd}",
         f"Tools: {len(session.tools)}",
         f"Skills: {len(session.skills)}",
@@ -432,6 +433,9 @@ def _status_command(context: CommandContext) -> CommandResult:
         f"Estimated context tokens: {session.context_token_estimate}",
         f"Context window: {session.context_window_tokens}",
     ]
+    if session.provider_name == "huggingface":
+        route = getattr(session, "inference_provider", None) or "automatic"
+        lines.append(f"Hugging Face inference provider: {route}")
     context_window_source = getattr(session, "context_window_source", None)
     if context_window_source:
         lines.append(f"Context window source: {context_window_source}")
@@ -439,12 +443,19 @@ def _status_command(context: CommandContext) -> CommandResult:
     if discovery_error:
         lines.append(f"Model limit discovery: unavailable ({discovery_error})")
     if context_usage is not None:
-        lines.append(
-            "Context token breakdown: "
-            f"system={context_usage.system_tokens}, "
-            f"messages={context_usage.message_tokens}, "
-            f"tools={context_usage.tool_tokens}",
-        )
+        if context_usage.uses_provider_usage:
+            lines.append(
+                "Context token basis: "
+                f"provider={context_usage.provider_tokens}, "
+                f"estimated trailing={context_usage.trailing_tokens}",
+            )
+        else:
+            lines.append(
+                "Context token breakdown: "
+                f"system={context_usage.system_tokens}, "
+                f"messages={context_usage.message_tokens}, "
+                f"tools={context_usage.tool_tokens}",
+            )
     lines.extend(_thinking_status_lines(session))
     lines.append(f"Resource diagnostics: {len(session.resource_diagnostics)}")
     if session.auto_compact_token_threshold is not None:
