@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 10 节：为什么同时需要 loop 与 harness？</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 10 · Agent platform interview · About 15 minutes</div>
+    <h1>为什么同时需要无状态 <code>loop</code> 与有状态 <code>harness</code>？</h1>
+    <p class="lede">这不是把代码随意拆成两个文件，而是把“单次运行的确定性算法”与“跨运行的状态和策略”放在不同部署边界。目标是能从职责、测试性与平台扩展三个角度解释这项设计。</p>
+  </header>
+
+  <nav>
+    <a href="#predict">先预测</a>
+    <a href="#trace">对象追踪</a>
+    <a href="#compare">架构比较</a>
+    <a href="#exercise">面试练习</a>
+    <a href="../reference/architecture-course-map.html">完整路线</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：先做架构预测</h2>
+    <div class="exercise">
+      <p>假设 Tau 删除 <code>AgentHarness</code>，把 <code>_messages</code>、<code>_running</code>、取消令牌、steering/follow-up 队列和 listeners 全部塞进 <code>run_agent_loop</code>。</p>
+      <p><strong>先预测：</strong>这样做最先会损害下面哪一项？为什么？</p>
+      <ol>
+        <li>模型回答质量</li>
+        <li>核心算法的可复用与可测试性</li>
+        <li>工具 schema 的表达能力</li>
+      </ol>
+      <p>不要只说“耦合更高”；试着指出一种具体测试或宿主实现会因此变难。</p>
+    </div>
+  </section>
+
+  <section id="trace">
+    <h2>3–7 分钟：追踪一个事件穿过两层边界</h2>
+    <p class="path">src/tau_agent/loop.py:44–168 · src/tau_agent/harness.py:146–202</p>
+
+    <div class="flow">
+      <div class="node">
+        <strong>run_agent_loop</strong>
+        <span>根据传入参数执行一次 run，以 <code>yield event</code> 暴露进度；不保存下一次 run 所需的宿主状态。</span>
+      </div>
+      <div class="node">
+        <strong>AgentHarness._run</strong>
+        <span>把自身持有的消息、队列回调和取消令牌注入 loop；逐个接收事件。</span>
+      </div>
+      <div class="node">
+        <strong>外部消费者</strong>
+        <span>listener 先收到广播；迭代 <code>prompt()</code> 的调用方随后收到同一事件。</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>关键执行顺序</h3>
+      <pre>async for event in run_agent_loop(...):
+    await self._notify(event)   # subscription port；逐个等待 listener
+    yield event                 # return port；交给 prompt() 的迭代调用方</pre>
+      <p>async generator 是<strong>拉取式</strong>的：下游请求下一项时，上游才继续推进。Tau 又在 <code>yield</code> 前等待 listeners，因此慢 listener 会把背压沿调用链传回 loop，甚至传到 provider stream。</p>
+    </div>
+
+    <div class="check">
+      <strong>边界判断：</strong><code>run_agent_loop</code> 只定义“事件按什么算法产生”；<code>AgentHarness</code> 决定“谁能启动、状态放哪里、运行中输入如何进入、事件如何向外传播”。
+    </div>
+  </section>
+
+  <section id="compare">
+    <h2>7–10 分钟：三种面试视角</h2>
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">职责</div>
+        <h3>Mechanism vs policy</h3>
+        <p><code>loop</code> 提供机制：模型调用、工具循环、控制流、事件。<code>harness</code> 提供宿主策略：单飞、取消、队列模式、订阅与跨 run 历史。</p>
+      </article>
+      <article class="phase">
+        <div class="label">测试性</div>
+        <h3>一次 run 可独立验证</h3>
+        <p>测试 loop 时可注入 provider、工具、消息列表和回调，收集事件后断言确定的状态转移；不必建立长期会话对象或模拟 UI 生命周期。</p>
+      </article>
+      <article class="phase">
+        <div class="label">复用性</div>
+        <h3>同一 engine，多种 host</h3>
+        <p>CLI、WebSocket 服务、后台 worker 或测试驱动器可复用同一 loop，但分别选择消息存储、并发控制、断线策略和事件分发方式。</p>
+      </article>
+      <article class="phase">
+        <div class="label">部署边界</div>
+        <h3>进程内对象不是最终平台</h3>
+        <p>Tau 的 harness 是进程内 host。生产平台可以把它的职责拆到 worker、队列、状态存储和事件总线；纯 loop 仍可作为 worker 内核。</p>
+      </article>
+    </div>
+
+    <div class="check">
+      <strong>不要过度声称：</strong>这里的“无状态”是指 loop 不拥有跨 run 的持久状态。它在单次 generator frame 内仍有 <code>turn</code>、<code>pending</code> 等局部状态，也会修改调用者传入的 <code>messages</code> 列表。
+    </div>
+  </section>
+
+  <section id="exercise">
+    <h2>10–14 分钟：面试中的 60 秒回答</h2>
+    <div class="exercise">
+      <p>请不用看答案，回答：</p>
+      <blockquote>“为什么不直接做一个有状态的 Agent 类，而要把纯 async generator loop 分离出来？”</blockquote>
+      <p>回答必须包含以下三个词，但不要只是罗列：</p>
+      <ol>
+        <li><strong>职责</strong></li>
+        <li><strong>测试</strong></li>
+        <li><strong>部署</strong></li>
+      </ol>
+      <p>控制在 4–6 句话。最好补充一个 trade-off：两层分离带来了什么额外成本？</p>
+    </div>
+
+    <details>
+      <summary>完成口头回答后，再展开参考结构</summary>
+      <p>我会把单次 run 的确定性状态机放在无状态 loop 中，把消息历史、并发守卫、取消、输入队列和事件订阅放在有状态 harness 中。这样职责清晰：loop 只负责 provider/tool 控制流，host 负责产品生命周期和策略。测试 loop 时可以直接注入 fake provider、工具和回调，收集事件并验证状态转移，不需要搭建完整会话宿主。部署时，同一个 loop 可以运行在 CLI、WebSocket worker 或任务队列消费者中，而 host 层可以替换为进程内对象或分布式状态编排。代价是需要维护两层接口，并明确消息列表的所有权、取消和背压如何跨边界传播。</p>
+    </details>
+  </section>
+
+  <section id="recap">
+    <h2>14–15 分钟：一句话检索</h2>
+    <blockquote><code>loop</code> 封装单次 run 的 ______，<code>harness</code> 封装跨 run 的 ______；这种拆分让同一核心更容易被不同 ______ 复用。</blockquote>
+    <p>建议答案关键词：<strong>算法/机制</strong>、<strong>状态/策略</strong>、<strong>宿主或部署形态</strong>。</p>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p><a href="../src/tau_agent/loop.py"><code>src/tau_agent/loop.py:44–168</code></a> 定义单次 run 的 provider/tool 算法和事件出口；<a href="../src/tau_agent/harness.py"><code>src/tau_agent/harness.py:61–202</code></a> 定义跨 run 状态、单飞、取消、队列与两个事件出口。行为判断应以这两份项目源码及相应测试为准。</p>
+  </section>
+
+  <section>
+    <h2>下一节</h2>
+    <p>Card 11 将进入可靠性：如果取消发生在 assistant 已经产生 tool call、但 tool result 尚未写回时，为什么必须补齐“中断结果”，而不能把孤儿调用留在历史中？</p>
+  </section>
+
+  <footer>遇到不清楚的地方，直接向教师追问。先完成 60 秒回答，再进入可靠性与协议修复。</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 5 节：为什么 loop 不直接操作 UI？</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 05 · tau_agent · About 15 minutes</div>
+    <h1>为什么 loop 不直接操作 UI？</h1>
+    <p class="lede">本节研究 <code>run_agent_loop</code> 的输出端：它不写屏幕、不存日志、不推 WebSocket——它只 <code>yield</code> 事件。为什么？事件有哪几层？</p>
+  </header>
+
+  <nav>
+    <a href="#predict">先预测</a>
+    <a href="#read">源码切片</a>
+    <a href="#exercise">分层练习</a>
+    <a href="#trace">追踪发射点</a>
+    <a href="#recap">一句话复述</a>
+    <a href="../reference/architecture-course-map.html">完整路线</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：先预测</h2>
+    <div class="exercise">
+      <p>你已知道 <code>run_agent_loop</code> 是一个 async generator，也知道 harness 的 listeners 用 <code>for listener in listeners: await listener(event)</code> 顺序通知。</p>
+      <p>思考两个问题：</p>
+      <ol>
+        <li>如果 loop 直接调用 <code>tui.render()</code> 或 <code>logger.write()</code>，会引入什么耦合？</li>
+        <li>一次包含工具调用的完整 agent run，你猜至少需要哪几种事件？（只凭直觉列）</li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="read">
+    <h2>3–8 分钟：读事件层级</h2>
+    <p class="path">src/tau_agent/events.py:15–87</p>
+
+    <p>整个文件只有 10 个事件类和一个联合类型。按粒度从粗到细分成四层：</p>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">Agent 层</div>
+        <h3>整个 run 的边界</h3>
+        <p><code>AgentStartEvent</code> 和 <code>AgentEndEvent</code>。一个 run 只发出一对。<code>AgentEndEvent.messages</code> 携带本次 run 新增的全部消息。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Turn 层</div>
+        <h3>一轮模型调用的边界</h3>
+        <p><code>TurnStartEvent</code> 和 <code>TurnEndEvent</code>。如果模型调了工具，loop 循环一次就多一对 turn 事件。<code>TurnEndEvent</code> 携带这一轮的 assistant message 和 tool results。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Message 层</div>
+        <h3>单条消息的生命周期</h3>
+        <p><code>MessageStartEvent</code>、<code>MessageUpdateEvent</code>、<code>MessageEndEvent</code>。无论是 prompt、assistant 回复还是 tool result，都经过同一组消息事件。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Tool 层</div>
+        <h3>工具执行进度</h3>
+        <p><code>ToolExecutionStartEvent</code>、<code>ToolExecutionUpdateEvent</code>、<code>ToolExecutionEndEvent</code>。嵌套在一轮 turn 内部，每个 tool call 一组。</p>
+      </article>
+    </div>
+
+    <div class="card">
+      <h3>联合类型：<code>AgentEvent</code></h3>
+      <pre>type AgentEvent = Annotated[
+    AgentStartEvent | AgentEndEvent
+  | TurnStartEvent | TurnEndEvent
+  | MessageStartEvent | MessageUpdateEvent | MessageEndEvent
+  | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolExecutionEndEvent,
+    Field(discriminator="type"),
+]</pre>
+      <p>所有事件共享一个 <code>type</code> 字段作为判别器，consumer 用 <code>isinstance</code> 或 <code>event.type</code> 就能分流。</p>
+    </div>
+
+    <div class="check">
+      <strong>设计意图：</strong>loop 只产出 AgentEvent，不知道谁在消费。TUI 渲染、CLI 日志、测试断言、WebSocket 推送——都是同一个 event stream 的不同 listener。
+    </div>
+  </section>
+
+  <section id="exercise">
+    <h2>8–12 分钟：分层练习</h2>
+    <div class="exercise">
+      <p>把下面 10 个事件按四层（Agent / Turn / Message / Tool）分类：</p>
+      <pre>AgentStartEvent    TurnStartEvent    MessageStartEvent    ToolExecutionStartEvent
+AgentEndEvent      TurnEndEvent      MessageUpdateEvent   ToolExecutionUpdateEvent
+                                     MessageEndEvent      ToolExecutionEndEvent</pre>
+      <p>然后回答：</p>
+      <ol>
+        <li>哪一层的事件在一次纯文本回答（没有工具调用）中<strong>不会出现</strong>？</li>
+        <li><code>MessageUpdateEvent</code> 嵌套了一个 <code>assistant_message_event</code> 字段。它的类型是什么？为什么需要嵌套？</li>
+        <li><code>TurnEndEvent</code> 既携带 <code>message</code> 又携带 <code>tool_results</code>——这两者的关系是什么？</li>
+      </ol>
+    </div>
+
+    <details>
+      <summary>回答后展开参考答案</summary>
+      <p><strong>1.</strong> Tool 层——纯文本回答不触发工具执行，三个 <code>ToolExecution*</code> 事件都不会出现。</p>
+      <p><strong>2.</strong> <code>AssistantMessageEvent</code>（来自 <code>provider_events.py</code>）。嵌套是因为 agent 层需要把厂商无关的 provider streaming 事件（text delta、thinking delta、tool call 等）透传给下游 consumer，同时保持 agent event 接口统一。consumer 可以只看 <code>MessageUpdateEvent</code>，也可以深入看嵌套的 provider event 做更细粒度的处理。</p>
+      <p><strong>3.</strong> <code>message</code> 是这一轮的 <code>AssistantMessage</code>（里面可能包含 <code>ToolCall</code> content blocks）；<code>tool_results</code> 是 loop 执行工具后收集的 <code>ToolResultMessage</code> 列表。它们是同一轮的因果关系：模型发出请求（message），loop 执行后返回结果（tool_results）。</p>
+    </details>
+  </section>
+
+  <section id="trace">
+    <h2>12–14 分钟：追踪发射点</h2>
+    <p class="path">src/tau_agent/loop.py:64–68, 113–125, 142–158</p>
+
+    <div class="card">
+      <h3>纯文本回答的最短事件序列</h3>
+      <pre>AgentStartEvent            ← loop.py:64
+TurnStartEvent             ← loop.py:65
+  MessageStartEvent        ← _assistant_events → loop.py:209
+  MessageUpdateEvent (×N)  ← _assistant_events → loop.py:219–222
+  MessageEndEvent          ← _assistant_events → loop.py:213
+TurnEndEvent               ← loop.py:158
+AgentEndEvent              ← loop.py:168</pre>
+      <p class="path">tests/test_agent_loop.py:71–80 验证了这个序列。</p>
+    </div>
+
+    <div class="card">
+      <h3>带一次工具调用的事件序列</h3>
+      <pre>AgentStartEvent
+TurnStartEvent
+  MessageStartEvent (assistant with ToolCall)
+  MessageUpdateEvent (×N)
+  MessageEndEvent
+  ToolExecutionStartEvent    ← _execute_tool_call → loop.py:232
+  ToolExecutionUpdateEvent   ← _execute_tool_call → loop.py:257 (if on_update)
+  ToolExecutionEndEvent      ← _execute_tool_call → loop.py:267
+  MessageStartEvent (tool result)   ← _execute_tool_call → loop.py:281
+  MessageEndEvent (tool result)     ← _execute_tool_call → loop.py:282
+TurnEndEvent
+TurnStartEvent (second turn)
+  MessageStartEvent (final assistant)
+  MessageUpdateEvent (×N)
+  MessageEndEvent
+TurnEndEvent
+AgentEndEvent</pre>
+    </div>
+
+    <div class="check">
+      <strong>关键发现：</strong>tool execution 事件和 tool result message 事件是<strong>不同层</strong>的东西。<code>ToolExecutionEndEvent</code> 是执行进度通知（tool 层），紧跟着的 <code>MessageStart/EndEvent</code> 是把结果写入消息历史（message 层）。两者都在 <code>_execute_tool_call</code> 内发出，但语义不同。
+    </div>
+  </section>
+
+  <section id="recap">
+    <h2>14–15 分钟：一句话检索</h2>
+    <blockquote><code>run_agent_loop</code> 不操作任何外部系统，而是 <code>yield</code> ______ 类型的事件；这些事件分成 ______、______、______、______ 四层。</blockquote>
+
+    <div class="check">
+      <strong>面试表达：</strong>事件流是 loop 与外部世界唯一的输出通道。这实现了关注点分离：同一个 loop 可以驱动 TUI、CLI、HTTP API 或测试，只需要不同的 listener 订阅同一个 AgentEvent stream。
+    </div>
+  </section>
+
+  <section>
+    <h2>两层事件的关系</h2>
+    <div class="card">
+      <h3>provider events vs agent events</h3>
+      <pre>provider_events.py (12 种)    events.py (10 种)
+──────────────────────────    ──────────────────
+AssistantStartEvent      →   MessageStartEvent
+TextDeltaEvent           →   MessageUpdateEvent (嵌套原始 provider event)
+ThinkingDeltaEvent       →   MessageUpdateEvent
+ToolCallEndEvent         →   MessageUpdateEvent
+AssistantDoneEvent       →   MessageEndEvent
+AssistantErrorEvent      →   MessageEndEvent</pre>
+      <p class="path">转换发生在 src/tau_agent/loop.py:189–223 的 <code>_assistant_events()</code></p>
+      <p>Provider events 是模型流的原始粒度（text chunk、thinking chunk、tool call fragment）；Agent events 是 loop 暴露给外部的统一接口。<code>_assistant_events()</code> 做了一次协议抬升。</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p><a href="../src/tau_agent/events.py"><code>src/tau_agent/events.py</code></a> 定义 agent event 层级；<a href="../src/tau_agent/provider_events.py"><code>src/tau_agent/provider_events.py</code></a> 定义 provider event 层级；<a href="../src/tau_agent/loop.py"><code>src/tau_agent/loop.py:64–68, 189–223, 225–282</code></a> 是事件的发射位置；<a href="../tests/test_agent_loop.py"><code>tests/test_agent_loop.py:54–83</code></a> 验证最短事件序列。</p>
+  </section>
+
+  <section>
+    <h2>下一节</h2>
+    <p>下一张卡片走一遍没有工具调用的最简单 turn：loop 的 <code>while True</code> 怎样开始、模型怎样回复、以及循环怎样结束。</p>
+  </section>
+
+  <footer>本节只理解事件层级和发射点，不深入任何 consumer 的实现（TUI 渲染、CLI 输出等都属于产品层）。</footer>
+</main>
+</body>
+</html>

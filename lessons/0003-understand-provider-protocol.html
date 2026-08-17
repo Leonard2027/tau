@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 3 节：核心怎样与模型厂商解耦？</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 03 · tau_agent · About 15 minutes</div>
+    <h1>核心怎样做到不知道具体模型厂商？</h1>
+    <p class="lede">本节只研究一条架构 seam：<code>run_agent_loop</code> 不认识 Anthropic、OpenAI 或本地模型，它只认识 <code>ModelProvider</code> 协议。</p>
+  </header>
+
+  <nav>
+    <a href="#predict">先预测</a>
+    <a href="#read">源码切片</a>
+    <a href="#exercise">接口练习</a>
+    <a href="../reference/architecture-course-map.html">完整路线</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：先预测替换边界</h2>
+    <div class="exercise">
+      <p>假设现在使用远程模型，明天要换成本地模型。为了让 <code>run_agent_loop</code> 完全不用修改，模型适配器必须向核心稳定提供什么？</p>
+      <p>先写下：它需要接收哪些信息，以及应该以什么形式返回模型响应。</p>
+    </div>
+  </section>
+
+  <section id="read">
+    <h2>3–10 分钟：只读一个 Protocol</h2>
+    <p class="path">src/tau_agent/provider.py:13–32</p>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">Cancellation contract</div>
+        <h3><code>CancellationToken</code></h3>
+        <p>核心只要求一个 <code>is_cancelled() → bool</code> 能力。它不要求 provider 知道 UI 上的“停止按钮”或进程信号来自哪里。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Provider contract</div>
+        <h3><code>ModelProvider</code></h3>
+        <p>任何对象只要提供符合签名的 <code>stream_response(...)</code>，就可以站在 provider seam 后面；loop 依赖这个能力，而不是具体实现类。</p>
+      </article>
+    </div>
+
+    <div class="card">
+      <h3>输入：一次模型生成所需的 provider-neutral 上下文</h3>
+      <ul>
+        <li><code>model: str</code> — 选择哪个模型。</li>
+        <li><code>system: str</code> — 系统指令。</li>
+        <li><code>messages: list[AgentMessage]</code> — 已有对话历史。</li>
+        <li><code>tools: list[AgentTool]</code> — 模型可请求的工具契约。</li>
+        <li><code>signal: CancellationToken | None</code> — 可选取消信号。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h3>输出：统一的流式响应</h3>
+      <p><code>AsyncIterator[AssistantMessageEvent]</code>。具体 SDK 的 chunk、字段名和传输方式必须在 provider 实现内部转换为 <code>tau_agent.provider_events</code> 定义的统一事件。</p>
+    </div>
+
+    <p class="path">src/tau_agent/loop.py:189–223</p>
+    <div class="check">
+      <strong>调用方向：</strong>loop 调用 <code>provider.stream_response(...)</code>，再把统一的 provider events 转成更高层的 agent message events。依赖方向是“具体 provider 实现依赖核心协议”，而不是核心反过来依赖厂商 SDK。
+    </div>
+
+    <div class="check">
+      <strong>仓库证据：</strong><code>tests/test_pi_event_protocol.py:32–36</code> 会扫描整个 <code>src/tau_agent</code>，确保它没有导入 <code>tau_ai</code>。
+    </div>
+  </section>
+
+  <section id="exercise">
+    <h2>10–14 分钟：复述接口边界</h2>
+    <div class="exercise">
+      <p>你要新增一个 <code>LocalProvider</code>，但不修改 <code>run_agent_loop</code>。请回答：</p>
+      <ol>
+        <li>它必须实现哪个方法？</li>
+        <li>该方法的五项输入是什么？</li>
+        <li>它必须返回什么类型？</li>
+        <li>厂商 SDK 的原始 streaming chunks 应该在哪一层被转换？</li>
+      </ol>
+      <p>请先用自己的话回答，再展开参考答案。</p>
+    </div>
+
+    <details>
+      <summary>回答后展开参考答案</summary>
+      <p><strong>方法：</strong><code>stream_response()</code>。</p>
+      <p><strong>输入：</strong><code>model</code>、<code>system</code>、<code>messages</code>、<code>tools</code>、<code>signal</code>。</p>
+      <p><strong>输出：</strong><code>AsyncIterator[AssistantMessageEvent]</code>。</p>
+      <p><strong>转换位置：</strong>具体 provider adapter 内部；<code>tau_agent</code> 只消费统一事件。</p>
+    </details>
+  </section>
+
+  <section id="recap">
+    <h2>14–15 分钟：一句话检索</h2>
+    <blockquote><code>run_agent_loop</code> 不依赖具体厂商，而是依赖 ______；具体适配器把厂商流转换成 ______。</blockquote>
+
+    <div class="check">
+      <strong>面试表达：</strong>这是一条依赖倒置边界：高层 agent loop 定义它需要的最小协议，低层厂商适配器实现该协议。
+    </div>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p><a href="../src/tau_agent/provider.py"><code>src/tau_agent/provider.py</code></a> 是本节主来源；<a href="../src/tau_agent/loop.py"><code>src/tau_agent/loop.py:189–223</code></a> 展示协议的消费位置；<a href="../tests/test_pi_event_protocol.py"><code>tests/test_pi_event_protocol.py:32–36</code></a> 提供依赖边界的可执行证据。任何输入或事件类型不清楚，都可以直接问教师。</p>
+  </section>
+
+  <section>
+    <h2>下一节</h2>
+    <p>下一张卡片研究核心眼中的工具：schema、执行函数、结果和执行模式怎样组成 <code>AgentTool</code>。</p>
+  </section>
+
+  <footer>本节只理解 provider seam，不进入任何厂商 SDK 的请求格式或鉴权细节。</footer>
+</main>
+</body>
+</html>

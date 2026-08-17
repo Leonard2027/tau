@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 17 节：上下文怎样被压缩而不丢历史？</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 17 · Local compaction · About 15 minutes</div>
+    <h1>上下文怎样被压缩而不丢历史？</h1>
+    <p class="lede">压缩不删除任何旧行、不断链。Tau 只 append 一条 <code>CompactionEntry</code>（含 <code>replaces_entry_ids</code>）并把 leaf 移到它上面；replay 时用它替换若干旧消息为一条摘要。自动/溢出压缩走“保最近 20k token”，增量压缩避免旧摘要被反复压缩。</p>
+  </header>
+
+  <nav>
+    <a href="0016-branch-without-rewriting-history.html">上一节：分支</a>
+    <a href="#predict">先预测</a>
+    <a href="#trigger">触发策略</a>
+    <a href="#keep-recent">保最近策略</a>
+    <a href="#replay">replay 替换</a>
+    <a href="#incremental">增量压缩</a>
+    <a href="#exercise">日志练习</a>
+    <a href="../reference/durable-session-glossary.md">术语表</a>
+    <a href="../reference/card14-durable-session-log-primary-sources.md">研究资料</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：压缩会删掉旧消息吗？</h2>
+    <div class="exercise">
+      <p>一个 session 有 10 条消息，自动压缩把前 6 条压成一段摘要。</p>
+      <p>请预测：</p>
+      <ol>
+        <li>JSONL 文件里，那 6 条旧 <code>MessageEntry</code> 还在吗？</li>
+        <li>压缩后 <code>state.messages</code> 里有几条消息？</li>
+        <li>如果之后再 <code>branch_to_entry</code> 回到那 6 条里的某一条，还能恢复原始消息吗？</li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="trigger">
+    <h2>3–6 分钟：什么时候触发压缩</h2>
+    <p class="path">src/tau_coding/session.py:1504–1606, 1842–1860, 1961–1974 · context_window.py:166–170</p>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">自动</div>
+        <h3>超阈值触发</h3>
+        <p>挂在 prompt 前/后、continue 后（<code>session.py:1560/1667/1707</code>）。判定：有阈值、active context ≥ 2 条、<code>context_token_estimate &gt; threshold</code>。</p>
+      </article>
+      <article class="phase">
+        <div class="label">溢出</div>
+        <h3>provider overflow</h3>
+        <p>provider 返回 context overflow 错误时（<code>session.py:1596</code>）触发，压缩成功后自动重试一次（<code>max_attempts=1</code>）。压缩失败只记日志，不丢原轮次。</p>
+      </article>
+      <article class="phase">
+        <div class="label">手动</div>
+        <h3>用户 <code>compact()</code></h3>
+        <p>用户主动调用，压<strong>整个</strong> active context（<code>_manual_compaction_plan</code>）。</p>
+      </article>
+    </div>
+
+    <div class="card">
+      <h3>阈值怎么定</h3>
+      <pre># context_window.py:166
+def auto_compaction_threshold_for_context_window(context_window_tokens):
+    return max(1, context_window_tokens - DEFAULT_COMPACTION_RESERVE_TOKENS)
+# DEFAULT_COMPACTION_RESERVE_TOKENS = 16_384</pre>
+      <p>即：<strong>上下文窗口 − 16,384 token</strong>，提前在安全距离触发。</p>
+    </div>
+  </section>
+
+  <section id="keep-recent">
+    <h2>6–10 分钟：保最近策略（压哪些）</h2>
+    <p class="path">src/tau_coding/session.py:2037–2080 · context_window.py:23</p>
+
+    <p>自动和溢出都走 <code>_recent_preserving_compaction_plan</code>，核心是“保最近”：</p>
+
+    <div class="card">
+      <pre># DEFAULT_COMPACTION_KEEP_RECENT_TOKENS = 20_000  (context_window.py:23)
+first_kept_index = _first_recent_context_index(rows, keep_recent_tokens=20_000)
+replaced = rows[:first_kept_index]   # 压最旧的这一段
+
+# _first_recent_context_index：从尾往前累积 token
+accumulated = 0
+for index 从最后一条 到 最前一条:
+    accumulated += estimate_message_tokens(message)
+    if accumulated >= 20_000:      # 凑满 20k
+        candidate_index = index
+        break</pre>
+      <p><strong>保留尾部累积约 20,000 token 的消息，其余全部压缩。</strong></p>
+    </div>
+
+    <div class="check">
+      <strong>边界校正（最严谨处）：</strong>20k 切点很少刚好落在消息边界，所以校准：
+      <ul>
+        <li>切点命中 <code>user</code> 且非第一条 → 再退一格，把整条 user 提问也压掉，避免劈开</li>
+        <li>切点命中非 user → 向后找下一个 user 消息作为切点</li>
+        <li>找不到 user → 向后找第一个非 toolResult 消息（避免 tool result 失去它的 assistant 调用）</li>
+      </ul>
+      <p>压缩永远切在<strong>语义干净</strong>的边界上，保证 provider 能继续消费 transcript。</p>
+    </div>
+  </section>
+
+  <section id="replay">
+    <h2>10–12 分钟：压缩结果怎么落盘与替换</h2>
+    <p class="path">src/tau_coding/session.py:2060–2085 · tau_agent/session/memory.py:106–125</p>
+
+    <div class="card">
+      <h3>append 三步曲（和分支同一结构）</h3>
+      <pre>compaction = CompactionEntry(parent_id=self._last_parent_id,
+                             summary=summary,
+                             replaces_entry_ids=被压缩的旧消息 id)
+await self._append_session_entry(compaction)
+leaf = LeafEntry(parent_id=compaction.id, entry_id=compaction.id)
+await self._append_session_entry(leaf)
+self._last_parent_id = compaction.id
+await self._refresh_persisted_state(leaf_id=compaction.id)
+self._harness.replace_messages(self._state.messages)</pre>
+    </div>
+
+    <p>replay 时 <code>_apply_compaction</code>（<code>memory.py:106</code>）把 <code>replaces_entry_ids</code> 指的那些旧消息<strong>替换成一条</strong> <code>"Previous conversation summary:\n&lt;summary&gt;"</code> 的 user 摘要：</p>
+
+    <div class="card">
+      <pre>replaced_ids = set(entry.replaces_entry_ids)
+for entry_id, message in message_rows:
+    if entry_id not in replaced_ids:
+        retained.append((entry_id, message))   # 没被压的留下
+    # 被压的 → 不 append 内容，只插入一条 summary</pre>
+    </div>
+
+    <div class="check">
+      <strong>核心洞察：</strong>compaction 不删除任何 entry。旧 MessageEntry 永远留在 JSONL 里（可审计）；它只在 replay 时，把 <code>replaces_entry_ids</code> 指的消息替换成摘要。<code>state.messages</code> 变短，但文件真相不变。
+    </div>
+
+    <div class="card">
+      <h3>在 provider 上下文里长什么样</h3>
+      <p>摘要是一条普通的 <code>UserMessage</code>，排在最前：</p>
+      <pre>system prompt
+└── [UserMessage] "Previous conversation summary:\n&lt;结构化摘要&gt;"   ← 压缩占位
+    [UserMessage] ...最近保留的消息...
+    [UserMessage] 用户新提问</pre>
+      <p>格式是结构化的（<code>## Goal</code> / <code>## Constraints &amp; Preferences</code> / <code>## Progress</code> / <code>## Key Decisions</code> / <code>## Next Steps</code> / <code>## Critical Context</code>），目标是“让另一个 LLM 能继续工作”。</p>
+    </div>
+  </section>
+
+  <section id="incremental">
+    <h2>12–14 分钟：增量压缩（避免旧摘要被反复压缩）</h2>
+    <p class="path">src/tau_coding/context_window.py:204–224, 268–280 · session.py:1989–2007</p>
+
+    <p>第二次压缩时，旧摘要不能当普通内容重新总结——否则每压一次信息损失一层。Tau 用代码保证它<strong>从不进入待压缩内容</strong>：</p>
+
+    <div class="card">
+      <pre># _split_previous_compaction_summary：识别并剥离旧摘要
+first = messages[0]
+if first 是 UserMessage 且以 "Previous conversation summary:\n" 开头:
+    return 剥离前缀后的内容, messages[1:]   # (previous_summary, new_messages)
+
+# build_compaction_summary_prompt：只序列化新消息
+conversation = serialize_messages_for_compaction(new_messages)
+prompt = f"&lt;conversation&gt;\n{conversation}\n&lt;/conversation&gt;\n\n"
+if previous_summary is not None:
+    prompt += f"&lt;previous-summary&gt;\n{previous_summary}\n&lt;/previous-summary&gt;\n\n"
+    base_prompt = UPDATE_SUMMARIZATION_PROMPT   # ← 增量更新
+else:
+    base_prompt = SUMMARIZATION_PROMPT          # ← 全新总结</pre>
+    </div>
+
+    <div class="check">
+      <strong>关键：</strong><code>&lt;conversation&gt;</code> 里<strong>只有新消息</strong>，旧摘要绝不被重新序列化成待压缩内容。它单独放进 <code>&lt;previous-summary&gt;</code> 标签，并切换到 <code>UPDATE_SUMMARIZATION_PROMPT</code> —— 明确要求：
+      <ul>
+        <li><strong>PRESERVE</strong> all existing information from the previous summary</li>
+        <li><strong>ADD</strong> new progress, decisions, and context from the new messages</li>
+        <li>UPDATE Progress / Next Steps 状态</li>
+      </ul>
+    </div>
+
+    <p><strong>边界：</strong>如果压缩后第一条消息不是那个前缀开头的 UserMessage（例如用户压缩后马上又发了一条新 user 提问），<code>_split_previous_compaction_summary</code> 返回 <code>None</code>，走全新的 <code>SUMMARIZATION_PROMPT</code>，把摘要当普通内容重新总结。</p>
+  </section>
+
+  <section id="exercise">
+    <h2>14–15 分钟：从日志判断压缩结果</h2>
+    <div class="exercise">
+      <p>文件依次包含：</p>
+      <pre>E1  SessionInfoEntry(parent=None)
+E2  MessageEntry(parent=E1, user="setup")
+E3  MessageEntry(parent=E2, assistant="ok")
+E4  MessageEntry(parent=E3, user="fix bug")
+E5  MessageEntry(parent=E4, assistant="done")
+L5  LeafEntry(entry_id=E5)
+C   CompactionEntry(parent=E5, summary="<摘要>", replaces_entry_ids=[E2, E3, E4])
+Lc  LeafEntry(parent_id=C, entry_id=C)</pre>
+      <p>请回答：</p>
+      <ol>
+        <li><code>path_to_entry(entries, C)</code> 会经过哪些 entry？被压缩的 E2/E3/E4 还在链上吗？</li>
+        <li>重放后 <code>state.messages</code> 有哪些消息？（摘要长什么样）</li>
+        <li>如果之后 <code>branch_to_entry("E3")</code>，还能恢复原始 E2/E3 吗？重放会经过 C 吗？</li>
+        <li>第二次压缩时，如果 <code>messages[0]</code> 就是第一条压缩留下的摘要，会走哪个 prompt？</li>
+      </ol>
+    </div>
+
+    <details>
+      <summary>回答后展开参考答案</summary>
+      <p><strong>1.</strong> 会经过 <code>C → E5 → E4 → E3 → E2 → E1</code>。E2/E3/E4 <strong>仍在链上</strong>——C 的 parent 是 E5，链没断。</p>
+      <p><strong>2.</strong> <code>[UserMessage("Previous conversation summary:\n&lt;摘要&gt;"), UserMessage("fix bug"), AssistantMessage("done")]</code>。E2/E3/E4 被替换成一条摘要；E5（含 E5 自己这条"done"）保留。注意：摘要占位 + E4/E5 保留消息。</p>
+      <p><strong>3.</strong> 能。分支到 E3 → <code>path_to_entry(entries, E3)</code> 走 <code>E1→E2→E3</code>，<strong>不经过 C</strong>（C 是 E3 的后代）。原始 E2/E3 完整恢复，压缩被绕过。</p>
+      <p><strong>4.</strong> 走 <code>UPDATE_SUMMARIZATION_PROMPT</code>（增量更新）。<code>_split_previous_compaction_summary</code> 识别前缀 → 剥到 <code>&lt;previous-summary&gt;</code> → 增量合并新消息。</p>
+    </details>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p><a href="../src/tau_coding/session.py"><code>tau_coding/session.py:1961–2085</code></a> 的自动压缩、keep-recent 计划与 <code>_append_compaction</code>；<a href="../src/tau_coding/context_window.py"><code>context_window.py:23, 166–170, 204–280</code></a> 的阈值、摘要 prompt 与增量分割；<a href="../src/tau_agent/session/memory.py"><code>memory.py:106–125</code></a> 的 replay 替换。外部资料汇总见 <a href="../reference/card14-durable-session-log-primary-sources.md">Card 14 reference</a>，对照阅读 <a href="https://platform.claude.com/docs/en/build-with-claude/compaction">Claude compaction 文档</a>。</p>
+  </section>
+
+  <section>
+    <h2>后续规划</h2>
+    <p>Card 15 将进入二次开发练习：在现有 seam（session entries / events / harness 扩展点）上增加一个本地恢复或日志可观测性的小改动及测试，作为面试证据。具体微课会在开始这项 guided exercise 时再设计。</p>
+  </section>
+
+  <footer>本节只解决压缩的触发、选择与替换语义。下一步是可复用 seam 的动手练习。</footer>
+</main>
+</body>
+</html>

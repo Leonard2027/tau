@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 4 节：核心眼中的工具是什么？</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 04 · tau_agent · About 15 minutes</div>
+    <h1>核心眼中的工具是什么？</h1>
+    <p class="lede">工具不只是一个 Python 函数。<code>AgentTool</code> 把模型可见的 schema、运行时 executor、标准结果以及可选的产品层提示组合成一个 provider-neutral 契约。</p>
+  </header>
+
+  <nav>
+    <a href="#predict">先预测</a>
+    <a href="#read">源码切片</a>
+    <a href="#exercise">边界练习</a>
+    <a href="../reference/architecture-course-map.html">完整路线</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：先拆解一个 read 工具</h2>
+    <div class="exercise">
+      <p>如果要把本地 <code>read</code> 能力暴露给模型，仅有 <code>async def read(path)</code> 为什么还不够？</p>
+      <p>先预测核心至少需要哪三类信息：模型怎样知道如何调用、运行时怎样执行、结果怎样回到对话。</p>
+    </div>
+  </section>
+
+  <section id="read">
+    <h2>3–10 分钟：只读工具契约</h2>
+    <p class="path">src/tau_agent/tools.py:21–105</p>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">Model-facing</div>
+        <h3>名字、描述与输入 schema</h3>
+        <p><code>name</code>、<code>description</code> 和 <code>parameters</code> 告诉模型“有什么工具”以及“arguments 应该长什么样”。<code>input_schema</code> 是 provider payload builder 使用的别名。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Runtime-facing</div>
+        <h3><code>ToolExecutor</code></h3>
+        <p>executor 接收 <code>tool_call_id</code>、arguments、取消信号和进度回调，异步返回 <code>AgentToolResult</code>。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Canonical result</div>
+        <h3><code>AgentToolResult</code></h3>
+        <p>工具实现返回标准化的 content、details 和可选控制信息。它还是执行结果对象，尚未成为对话历史中的顶层消息。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Optional metadata</div>
+        <h3>提示、参数准备和 renderer</h3>
+        <p><code>prompt_snippet</code>、<code>prepare_arguments</code>、<code>render_call</code> 等允许产品层增加引导与展示；核心 loop 不直接渲染 UI。</p>
+      </article>
+    </div>
+
+    <p class="path">src/tau_agent/loop.py:225–282</p>
+    <div class="card">
+      <h3>执行链</h3>
+      <pre>ToolCall(name, id, arguments)
+→ 按 name 查找 AgentTool
+→ AgentTool.execute(...)
+→ AgentToolResult
+→ loop 包装成 ToolResultMessage
+→ 加入对话历史</pre>
+    </div>
+
+    <div class="check">
+      <strong>两个“result”不要混淆：</strong><code>AgentToolResult</code> 是 executor 的返回值；<code>ToolResultMessage</code> 是 loop 写入消息历史、再发送给模型的顶层记录。
+    </div>
+
+    <div class="check">
+      <strong>错误隔离：</strong>未知工具、被 policy 阻止、取消或 executor 抛出异常，都会被 loop 归一化为错误结果，而不是让厂商模型协议直接看到 Python 异常。
+    </div>
+  </section>
+
+  <section id="exercise">
+    <h2>10–14 分钟：把职责放回正确对象</h2>
+    <div class="exercise">
+      <p>为下面五项选择主要归属：<code>AgentTool</code>、<code>ToolExecutor</code>、<code>AgentToolResult</code> 或 <code>ToolResultMessage</code>。</p>
+      <ol>
+        <li>向模型声明 <code>path</code> 是必填字符串。</li>
+        <li>真正读取磁盘并报告执行进度。</li>
+        <li>保存文件内容与字节数等执行详情。</li>
+        <li>通过 <code>tool_call_id</code> 进入对话历史。</li>
+        <li>提供可选的工具调用展示文本。</li>
+      </ol>
+      <p>请先发送你的分类，再展开参考答案。</p>
+    </div>
+
+    <details>
+      <summary>回答后展开参考答案</summary>
+      <ol>
+        <li><code>AgentTool.parameters</code>。</li>
+        <li><code>ToolExecutor</code>。</li>
+        <li><code>AgentToolResult</code>。</li>
+        <li><code>ToolResultMessage</code>。</li>
+        <li><code>AgentTool.render_call</code>，由产品/展示层按需消费。</li>
+      </ol>
+    </details>
+  </section>
+
+  <section id="recap">
+    <h2>14–15 分钟：一句话检索</h2>
+    <blockquote><code>AgentTool</code> 同时描述模型可见的 ______ 和运行时可调用的 ______；executor 返回 ______，再由 loop 转成 ______。</blockquote>
+
+    <div class="check">
+      <strong>面试表达：</strong>工具契约把 schema、执行与标准结果解耦，使 loop 可以统一调度不同能力，并在边界处完成取消、policy、进度和错误处理。
+    </div>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p><a href="../src/tau_agent/tools.py"><code>src/tau_agent/tools.py:21–105</code></a> 是本节主来源；<a href="../src/tau_agent/loop.py"><code>src/tau_agent/loop.py:225–309</code></a> 展示工具结果如何被归一化并写成消息；<a href="../tests/test_agent_loop.py"><code>tests/test_agent_loop.py:124–243</code></a> 是具体行为证据。任何对象边界不清楚，都可以直接问教师。</p>
+  </section>
+
+  <section>
+    <h2>下一节</h2>
+    <p>下一张卡片研究 agent events：为什么 loop 只发事件，而不直接操作 CLI、日志或 TUI。</p>
+  </section>
+
+  <footer>本节只建立工具契约和结果转换，不提前展开完整 tool cycle。</footer>
+</main>
+</body>
+</html>

@@ -79,3 +79,17 @@ Each substantial phase should leave behind beginner-friendly notes under `dev-no
 When a phase adds or changes user-facing behavior, also update the published docs
 under `website/content/` (the "Use Tau" guides and reference).
 
+## Agent skills
+
+### Issue tracker
+
+Development work for this fork is tracked in `Leonard2027/tau` GitHub Issues; upstream `huggingface/tau` issues and pull requests are reference material. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Triage uses the five default canonical labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This repository uses its existing single-context documentation under `dev-notes/`, including design notes, implementation journals, and ADRs. See `docs/agents/domain.md`.
+

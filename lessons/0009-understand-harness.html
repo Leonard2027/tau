@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 9 节：AgentHarness 比裸 loop 多了什么？</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 09 · tau_agent · About 15 minutes</div>
+    <h1><code>AgentHarness</code> 比裸 loop 多了什么？</h1>
+    <p class="lede">loop 是无状态的 async generator；harness 是有状态的主机，负责把 run 的生命周期、输入队列、消息历史编排起来，并向外暴露事件与状态。</p>
+  </header>
+
+  <nav>
+    <a href="#predict">先预测</a>
+    <a href="#read">源码切片</a>
+    <a href="#exercise">状态练习</a>
+    <a href="../reference/architecture-course-map.html">完整路线</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：先预测状态归属</h2>
+    <div class="exercise">
+      <p><code>run_agent_loop(...)</code> 接收 <code>messages</code>、<code>tools</code>、<code>prompts</code>、<code>get_steering_messages</code>、<code>get_follow_up_messages</code> 等参数，是一个纯 async generator——它本身不持有跨 run 的状态。</p>
+      <p>如果产品要支持"一次对话跨多个 run（多次 prompt）"、运行中插入 steering/follow-up、以及取消，这些状态必须放在 loop 之外。猜猜 <code>AgentHarness</code> 至少要保存哪几类状态？</p>
+      <p>提示：三个词——<strong>生命周期</strong>、<strong>队列</strong>、<strong>消息历史</strong>。</p>
+    </div>
+  </section>
+
+  <section id="read">
+    <h2>3–10 分钟：读 harness 的状态字段与入口</h2>
+    <p class="path">src/tau_agent/harness.py:61–100, 146–217</p>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">生命周期</div>
+        <h3>running / signal / listeners</h3>
+        <p><code>_running</code> 标记单飞；<code>_current_signal</code> 是取消令牌（SimpleCancellationToken）；<code>_listeners</code> 是订阅者列表。prompt/continue_ 入口保证同一时刻只有一个 run。</p>
+      </article>
+      <article class="phase">
+        <div class="label">队列</div>
+        <h3>steering / follow-up</h3>
+        <p><code>_steering_queue</code>、<code>_follow_up_queue</code> 在 run 进行中接收插话，<code>queue_mode</code> 决定一次取一条还是全部。这些是消息注入语义，不是并行任务。</p>
+      </article>
+      <article class="phase">
+        <div class="label">消息历史</div>
+        <h3><code>_messages</code></h3>
+        <p>harness 持有跨 run 的完整对话历史。loop 每次 run 都往它追加，provider 下一次调用时作为上下文携带。</p>
+      </article>
+    </div>
+
+    <div class="card">
+      <h3>入口如何启动一个 run</h3>
+      <pre>def prompt_message(self, message):
+    self._ensure_not_running()          # 单飞守卫
+    self._append_interrupted_tool_results()   # 修复孤儿工具调用
+    self._running = True
+    return self._run(prompts=(message,))
+
+async def _run(self, *, prompts=()):
+    signal = SimpleCancellationToken()
+    self._current_signal = signal
+    try:
+        async for event in run_agent_loop(
+            messages=self._messages,     # harness 持有的历史
+            prompts=prompts,
+            get_steering_messages=self._drain_steering_messages,
+            get_follow_up_messages=self._drain_follow_up_messages,
+            ...
+        ):
+            await self._notify(event)    # 通知所有 listener
+            yield event
+    finally:
+        self._running = False</pre>
+    </div>
+
+    <div class="check">
+      <strong>分工：</strong>loop 只做"纯算法"（模型调用、工具调度、事件产出）；harness 负责"有状态编排"（何时允许跑、如何注入输入、把事件广播给谁）。同一个 loop 可以被不同 host 复用，只需各自提供状态。
+    </div>
+  </section>
+
+  <section id="exercise">
+    <h2>10–14 分钟：区分算法状态、生命周期和消息队列</h2>
+    <div class="exercise">
+      <p>把下面每一项归到 <strong>loop（纯算法）</strong> 或 <strong>harness（状态编排）</strong>：</p>
+      <ol>
+        <li><code>turn</code> 计数器、<code>has_more_tools</code></li>
+        <li><code>_running</code> 单飞守卫</li>
+        <li><code>_steering_queue</code> / <code>_follow_up_queue</code></li>
+        <li>把 assistant 结果 append 到 <code>messages</code></li>
+        <li>取消令牌 <code>SimpleCancellationToken</code></li>
+      </ol>
+    </div>
+
+    <details>
+      <summary>回答后展开参考答案</summary>
+      <ol>
+        <li><strong>loop</strong> —— 单次 run 内的纯算法变量，run 结束即消失。</li>
+        <li><strong>harness</strong> —— 跨 run 的生命周期状态。</li>
+        <li><strong>harness</strong> —— 跨 run 的输入队列。</li>
+        <li><strong>loop</strong> —— 它把结果写进传入的 <code>messages</code> 列表；harness 只是持有该列表。</li>
+        <li><strong>harness</strong> —— 它创建并传给 loop，loop 只读 <code>signal.is_cancelled()</code>。</li>
+      </ol>
+      <p>判断标准：<strong>状态是否跨 run 存续</strong>。只在单次 run 内有效 → loop；需要在下一次 run 仍存在 → harness。</p>
+    </details>
+  </section>
+
+  <section id="recap">
+    <h2>14–15 分钟：一句话检索</h2>
+    <blockquote><code>run_agent_loop</code> 是 ______（无状态/有状态）的 async generator，<code>AgentHarness</code> 是它的 ______（无状态/有状态）主机；harness 负责 ______ 生命周期、______ 队列和 ______ 消息历史。</blockquote>
+
+    <div class="check">
+      <strong>面试表达：</strong>把"算法"与"状态编排"分开，使纯 loop 可复用、可测试，同时让 harness 集中处理并发、取消、队列注入与事件广播——这是 agent 平台常见的"core engine + host/container"分层。
+    </div>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p><a href="../src/tau_agent/harness.py"><code>src/tau_agent/harness.py:61–100, 146–217</code></a> 是本节主来源；<a href="../src/tau_agent/loop.py"><code>src/tau_agent/loop.py:44–58</code></a> 对比纯 loop 的参数；<a href="../tests/test_agent_harness.py"><code>tests/test_agent_harness.py</code></a> 提供单飞、队列、取消的行为证据。</p>
+  </section>
+
+  <section>
+    <h2>下一节</h2>
+    <p>第一部分结束。下一部分从 Card 10 开始转向 Agent 后端/平台面试：为什么同时需要无状态 loop 与有状态 harness——用前九节的知识回答架构决策问题。</p>
+  </section>
+
+  <footer>本节只建立 harness 的状态边界，不展开取消后的孤儿工具修复（那是 Card 11）。</footer>
+</main>
+</body>
+</html>

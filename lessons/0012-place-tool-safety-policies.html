@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 12 节：工具安全策略应该放在哪个 seam？</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 12 · Tool safety · About 15 minutes</div>
+    <h1>授权、取消、隔离和错误归一化应该放在哪一层？</h1>
+    <p class="lede">工具安全不是一个布尔开关。Tau 把调用前策略、实际执行、调用后治理与标准结果写回分成几个 seam；平台工程师必须同时看见这些 seam 已经保证了什么，以及它们没有保证什么。</p>
+  </header>
+
+  <nav>
+    <a href="#predict">先预测</a>
+    <a href="#pipeline">执行管线</a>
+    <a href="#guarantees">保证与空缺</a>
+    <a href="#exercise">Policy gate</a>
+    <a href="../reference/architecture-course-map.html">完整路线</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：高风险工具放在哪里拦截？</h2>
+    <div class="exercise">
+      <p>模型产生：</p>
+      <pre>ToolCall(
+    id="call-9",
+    name="deploy",
+    arguments={"environment": "production"}
+)</pre>
+      <p>产品要求：只有拥有 <code>deploy:production</code> 权限且本次操作已获批准的用户才能执行。</p>
+      <p>你会优先把 gate 放在哪里？</p>
+      <ol>
+        <li>provider adapter：模型输出 tool call 时拦截</li>
+        <li><code>before_tool_call</code>：执行函数被调用前拦截</li>
+        <li><code>render_call</code>：UI 展示工具调用时拦截</li>
+        <li><code>after_tool_call</code>：部署完成后再检查</li>
+      </ol>
+      <p>再预测：被 gate 拒绝后，历史中应该没有任何结果，还是应该写回标准错误结果？</p>
+    </div>
+  </section>
+
+  <section id="pipeline">
+    <h2>3–8 分钟：读一次工具执行的安全管线</h2>
+    <p class="path">src/tau_agent/loop.py:225–305 · src/tau_agent/tools.py:15–105</p>
+
+    <ol class="steps">
+      <li>
+        <h3>先发出 start event</h3>
+        <p><code>ToolExecutionStartEvent</code> 记录 call ID、工具名和参数。注意：它表示执行流程开始处理这个请求，不证明真实工具已经运行。</p>
+      </li>
+      <li>
+        <h3><code>before_tool_call</code> 做执行前策略</h3>
+        <p>hook 接收完整 <code>ToolCall</code>，返回 <code>(blocked, reason)</code>。若被阻止，loop 不调用工具，而是创建 <code>is_error=True</code> 的标准结果。</p>
+      </li>
+      <li>
+        <h3>检查取消、工具存在性，再执行</h3>
+        <p>已取消 → <code>Operation aborted</code>；未知工具 → <code>Tool ... not found</code>；否则调用 <code>tool.execute(call.id, arguments, signal, on_update)</code>。</p>
+      </li>
+      <li>
+        <h3>工具异常被归一化</h3>
+        <p>普通 <code>Exception</code> 被转换为 <code>AgentToolResult</code> + <code>is_error=True</code>，使协议仍能写回结果。<code>asyncio.CancelledError</code> 特意重新抛出，不伪装成普通工具错误。</p>
+      </li>
+      <li>
+        <h3><code>after_tool_call</code> 做结果后处理</h3>
+        <p>它会看到成功、blocked、cancelled、unknown-tool 和 exception 等路径的结果，并可返回修改后的 <code>(result, is_error)</code>。适合结果脱敏、统一错误包装或受信任的结果治理。</p>
+      </li>
+      <li>
+        <h3>统一写回事件和消息</h3>
+        <p>无论成功还是可归一化失败，loop 都产生 <code>ToolExecutionEndEvent</code> 和对应的 <code>ToolResultMessage</code>，保持 call/result 协议完整。</p>
+      </li>
+    </ol>
+  </section>
+
+  <section id="guarantees">
+    <h2>8–10 分钟：区分“已有保证”与“可插入策略”</h2>
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">已有 · Authorization seam</div>
+        <h3>可在执行前阻止</h3>
+        <p><code>before_tool_call</code> 是 provider-neutral 的策略入口。但 Tau 不知道租户、用户角色或审批系统；这些必须由 host 注入。</p>
+      </article>
+      <article class="phase">
+        <div class="label">已有 · Cooperative cancellation</div>
+        <h3>令牌传给工具</h3>
+        <p>loop 在执行前检查 token，也把 token 传入 executor。工具若运行很久，仍需要主动观察 token；令牌本身不会强杀阻塞的外部进程。</p>
+      </article>
+      <article class="phase">
+        <div class="label">已有 · Error boundary</div>
+        <h3>异常变成标准结果</h3>
+        <p>普通工具异常不会直接留下孤儿调用，而会形成可观察、可写回的错误结果。这是异常隔离，不等于安全沙箱。</p>
+      </article>
+      <article class="phase">
+        <div class="label">空缺 · Timeout</div>
+        <h3>没有内置截止时间</h3>
+        <p>当前 loop 没有 per-tool timeout 参数。宿主需要包装 executor、使用超时作用域，或把调用交给具有 deadline 的独立执行服务。</p>
+      </article>
+      <article class="phase">
+        <div class="label">空缺 · Process isolation</div>
+        <h3>没有资源沙箱</h3>
+        <p><code>except Exception</code> 只能保护 Python 控制流，不能限制文件、网络、CPU、内存或系统调用。高风险工具应在容器、受限进程或远程 runner 中执行。</p>
+      </article>
+      <article class="phase">
+        <div class="label">受信任边界 · Hooks</div>
+        <h3>hook 自己也可能失败</h3>
+        <p><code>before_tool_call</code>/<code>after_tool_call</code> 的异常没有在该函数内归一化，因此 hook 属于受信任的 runtime policy code；生产实现应自行处理依赖故障和 fail-open/fail-closed 语义。</p>
+      </article>
+    </div>
+
+    <div class="check">
+      <strong>面试判断：</strong>“核心暴露了 hook”不等于“系统已经安全”。hook 只是策略注入点；权限来源、审批状态、租户隔离、超时和沙箱仍属于平台设计。
+    </div>
+  </section>
+
+  <section id="exercise">
+    <h2>10–14 分钟：设计最小 production deploy gate</h2>
+    <div class="exercise">
+      <p>请设计一个 <code>before_tool_call</code> 策略，只描述判断流程，不需要写完整代码。要求：</p>
+      <ol>
+        <li>非 <code>deploy</code> 工具直接允许；</li>
+        <li><code>staging</code> 部署允许；</li>
+        <li><code>production</code> 部署必须同时拥有权限和审批记录；</li>
+        <li>权限服务不可用时，必须明确选择 fail-open 或 fail-closed；</li>
+        <li>拒绝时返回不泄露敏感信息、但能帮助用户行动的原因。</li>
+      </ol>
+      <p>然后回答：超时和容器隔离能否也只靠这个 hook 完成？</p>
+    </div>
+
+    <details>
+      <summary>完成设计后展开参考结构</summary>
+      <pre>if call.name != "deploy":
+    return False, None
+
+if call.arguments["environment"] != "production":
+    return False, None
+
+try:
+    authorized = await permission_service.check(...)
+    approved = await approval_store.has_valid_approval(...)
+except DependencyUnavailable:
+    return True, "Production deployment blocked: policy service unavailable"
+
+if not authorized:
+    return True, "Production deployment requires deploy permission"
+if not approved:
+    return True, "Production deployment requires an active approval"
+return False, None</pre>
+      <p>该 gate 应 fail-closed，因为无法验证高风险操作时不应执行。它可以决定“是否允许”，但不能单独提供强制超时或资源隔离；后两者需要 executor wrapper 或独立 sandbox runner。</p>
+    </details>
+  </section>
+
+  <section id="recap">
+    <h2>14–15 分钟：一句话检索</h2>
+    <blockquote><code>before_tool_call</code> 负责执行前 ______；<code>after_tool_call</code> 负责结果 ______；loop 会把普通工具异常 ______，但 timeout 与进程 sandbox 仍需由 ______ 提供。</blockquote>
+    <p>建议答案关键词：<strong>授权/策略</strong>、<strong>治理/转换</strong>、<strong>归一化</strong>、<strong>宿主或独立执行层</strong>。</p>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p><a href="../src/tau_agent/loop.py"><code>src/tau_agent/loop.py:225–305</code></a> 定义执行前 hook、取消、未知工具、异常边界和执行后 hook；<a href="../src/tau_agent/tools.py"><code>src/tau_agent/tools.py:15–105</code></a> 定义取消令牌、executor 与标准结果协议；<a href="../tests/test_agent_loop.py"><code>tests/test_agent_loop.py:174–243</code></a> 验证 call ID、取消令牌、进度事件和未知工具错误归一化。</p>
+  </section>
+
+  <section>
+    <h2>下一节</h2>
+    <p>Card 13 将进入 streaming：provider 的细粒度增量怎样变成稳定的客户端事件契约，以及慢消费者、断线和重放怎样改变当前的进程内背压模型。</p>
+  </section>
+
+  <footer>遇到不清楚的地方，直接向教师追问。本节只设计最小 policy gate，不把 hook 误当作完整的安全沙箱。</footer>
+</main>
+</body>
+</html>

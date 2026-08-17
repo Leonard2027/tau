@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reference: 工具执行链与运行时管理</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Reference · tau_agent · Tool execution &amp; runtime</div>
+    <h1>工具执行链与运行时管理</h1>
+    <p class="lede">从产品工具装配到 loop 调度、策略 gate、取消、中断修复和并发模型的快速参考；准确区分核心已有保证、host 可注入策略与当前安全空缺。</p>
+  </header>
+
+  <nav>
+    <a href="#assembly">装配阶段</a>
+    <a href="#dispatch">运行阶段</a>
+    <a href="#cancel">取消与修复</a>
+    <a href="#safety">安全边界</a>
+    <a href="#concurrency">并发模型</a>
+    <a href="#steering">消息队列</a>
+    <a href="#interview">面试要点</a>
+    <a href="architecture-course-map.html">课程路线</a>
+  </nav>
+
+  <section id="assembly">
+    <h2>装配阶段：程序启动时</h2>
+    <p>这一阶段还没有模型调用任何工具。</p>
+
+    <div class="flow">
+      <div class="node">
+        <strong>产品层 executor</strong>
+        <span>真正的读文件、运行 shell 逻辑。属于 <code>tau_coding</code>，知道 cwd、路径处理、输出截断等产品策略。</span>
+      </div>
+      <div class="node">
+        <strong>AgentTool</strong>
+        <span>provider-neutral 插头：名称、schema、executor、renderer 与声明性元数据。属于 <code>tau_agent</code>。</span>
+      </div>
+      <div class="node">
+        <strong>AgentHarness</strong>
+        <span>持有 <code>list[AgentTool]</code>、消息历史、取消令牌、队列、hooks 和 listeners。</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>装配路径</h3>
+      <pre>tau_coding executor         → AgentTool(name, params, execute_fn)
+                              → list[AgentTool]
+                              → AgentHarnessConfig.tools
+                              → AgentHarness</pre>
+      <p class="path">src/tau_coding/tools.py:75–136 · src/tau_coding/session.py:343–373</p>
+    </div>
+  </section>
+
+  <section id="dispatch">
+    <h2>运行阶段：模型请求工具</h2>
+
+    <div class="card">
+      <h3>完整执行链</h3>
+      <pre>UserMessage("读取 README.md")
+  ↓ provider.stream_response(...)
+AssistantMessage(content=[ToolCall(id="call-1", name="read")])
+  ↓ loop 按 name 查找；进入 _execute_tool_call
+ToolExecutionStartEvent                         # 表示开始处理请求
+  ↓ before_tool_call(call)                      # 可阻止
+  ↓ cancellation check / unknown-tool check
+  ↓ AgentTool.execute(..., signal, on_update)   # 产品 executor
+  ↓ ToolExecutionUpdateEvent*                   # 可选进度
+  ↓ Exception → 标准错误结果；CancelledError 重抛
+  ↓ after_tool_call(call, result, is_error)     # 结果治理
+ToolExecutionEndEvent
+  ↓ loop 包装
+ToolResultMessage(tool_call_id="call-1", tool_name="read")
+  ↓ 放回消息历史
+模型根据工具结果生成最终 AssistantMessage</pre>
+      <p class="path">src/tau_agent/loop.py:80, 139–158, 225–306 · src/tau_agent/harness.py:161–184</p>
+    </div>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">ToolCall</div>
+        <h3>模型发出的请求</h3>
+        <p>assistant content block，不是顶层消息。包含 <code>id</code>、<code>name</code>、<code>arguments</code>。</p>
+      </article>
+      <article class="phase">
+        <div class="label">AgentTool</div>
+        <h3>系统注册的可执行契约</h3>
+        <p>loop 以 <code>ToolCall.name</code> 查找；真正副作用由产品层 executor 完成。</p>
+      </article>
+      <article class="phase">
+        <div class="label">AgentToolResult</div>
+        <h3>executor 的运行时结果</h3>
+        <p>还不是对话消息，包含标准 content、details 与可选 added tools。</p>
+      </article>
+      <article class="phase">
+        <div class="label">ToolResultMessage</div>
+        <h3>写入历史的顶层消息</h3>
+        <p>通过 <code>tool_call_id</code> 关联原始 call，并保留 <code>tool_name</code> 与 <code>is_error</code>。</p>
+      </article>
+    </div>
+
+    <div class="check">
+      <strong>事件语义：</strong><code>ToolExecutionStartEvent</code> 表示 runtime 开始处理请求，不证明 executor 已运行；被 policy gate 拒绝的调用也会先出现 start，随后以标准错误 end/result 收束。
+    </div>
+  </section>
+
+  <section id="cancel">
+    <h2>取消与中断修复</h2>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">协作式取消</div>
+        <h3>令牌需要各层观察</h3>
+        <p><code>harness.cancel()</code> 设置 cancellation token。provider 可停止流式输出，loop 在工具前检查，长运行工具还要主动观察 token。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Bash 特例</div>
+        <h3>等待进程或取消先完成</h3>
+        <p>bash 用 <code>asyncio.wait(..., FIRST_COMPLETED)</code> 同时等待进程和取消；POSIX 下以新 session 启动并用 <code>os.killpg</code> 杀掉整个 process group。</p>
+      </article>
+    </div>
+
+    <div class="card">
+      <h3>孤儿 tool call 的补偿记录</h3>
+      <p>如果 <code>AssistantMessage</code> 已包含 <code>ToolCall</code>，但历史中没有相同 ID 的 <code>ToolResultMessage</code>，Harness 追加：</p>
+      <pre>ToolResultMessage(
+    tool_call_id=call.id,
+    tool_name=call.name,
+    content=[TextContent(text="Tool call interrupted by user")],
+    is_error=True,
+)</pre>
+      <p>修复发生在三个时机：新 <code>prompt_message()</code> 前、<code>continue_()</code> 前，以及已观察到取消时的 <code>_run()</code> <code>finally</code>。入口修复也覆盖从持久化日志或旧版本加载的历史。</p>
+      <p class="path">src/tau_agent/harness.py:146–190, 219–244</p>
+    </div>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">Completeness</div>
+        <h3>每个 call 都有终态</h3>
+        <p>成功结果或明确错误结果都会闭合 <code>ToolCall.id</code>。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Idempotency</div>
+        <h3>重复修复不重复追加</h3>
+        <p><code>returned_ids</code> 使已有结果的 call 被跳过。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Auditability</div>
+        <h3>不删除发生过的请求</h3>
+        <p>保留“模型请求过工具，但执行未完成”的事实。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Replayability</div>
+        <h3>恢复后可继续</h3>
+        <p>完整 call/result 配对避免 provider 面对悬空请求。</p>
+      </article>
+    </div>
+
+    <div class="check">
+      <strong>补偿，不是重试：</strong>中断结果只声明这次调用没有成功完成，不会重新执行工具。对邮件、扣款、文件写入或部署等有副作用的工具，盲目重试可能重复执行。
+    </div>
+  </section>
+
+  <section id="safety">
+    <h2>工具安全：已有 seam 不等于完整沙箱</h2>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">已有 · Authorization seam</div>
+        <h3>执行前可以阻止</h3>
+        <p><code>before_tool_call</code> 接收完整 call，适合由 host 注入权限、审批和高风险参数策略；被拒绝后仍写回标准错误结果。</p>
+      </article>
+      <article class="phase">
+        <div class="label">已有 · Error boundary</div>
+        <h3>普通异常被归一化</h3>
+        <p>executor 的普通 <code>Exception</code> 变成 <code>AgentToolResult</code> + <code>is_error=True</code>；<code>asyncio.CancelledError</code> 特意重抛。</p>
+      </article>
+      <article class="phase">
+        <div class="label">已有 · Result governance</div>
+        <h3>执行后统一处理</h3>
+        <p><code>after_tool_call</code> 可处理成功、blocked、cancelled、unknown-tool 和 exception 路径，适合脱敏和统一结果包装。</p>
+      </article>
+      <article class="phase">
+        <div class="label">空缺 · Generic timeout</div>
+        <h3>loop 没有 per-tool deadline</h3>
+        <p>核心 loop 没有统一 timeout；具体工具可自行实现（如 bash 的可选 timeout），其他工具需 executor wrapper 或独立 runner。</p>
+      </article>
+      <article class="phase">
+        <div class="label">空缺 · Process isolation</div>
+        <h3>异常边界不是资源沙箱</h3>
+        <p>Python 异常归一化不会限制文件、网络、CPU、内存或系统调用。高风险执行需要受限进程、容器或独立服务。</p>
+      </article>
+      <article class="phase">
+        <div class="label">受信任边界 · Hooks</div>
+        <h3>policy code 自己也会失败</h3>
+        <p>hooks 的异常不在 <code>_execute_tool_call</code> 内归一化。host 必须决定依赖故障时 fail-open 还是 fail-closed，并处理 hook 自身错误。</p>
+      </article>
+    </div>
+
+    <div class="check">
+      <strong>Canonical failures：</strong>已取消是 <code>Operation aborted</code>；未知工具是 <code>Tool &lt;name&gt; not found</code>。这些路径和 blocked/exception 一样，最终形成 <code>ToolExecutionEndEvent</code> 与 <code>ToolResultMessage</code>。
+    </div>
+    <p class="path">src/tau_agent/loop.py:225–306 · src/tau_agent/tools.py:15–105</p>
+  </section>
+
+  <section id="concurrency">
+    <h2>并发模型</h2>
+
+    <div class="card">
+      <h3>当前执行拓扑</h3>
+      <pre>AgentHarness
+  │  同时只允许一个 active run (single-flight)
+  │
+  └── run_agent_loop (async generator)
+        │  顺序消费 provider stream
+        │  按 for call in calls 顺序执行 ToolCall
+        │  顺序产生 AgentEvent
+        │
+        └── 具体工具内部可以自行并发
+              └── bash: process.communicate vs cancellation
+                    → FIRST_COMPLETED
+                    → timeout/cancel 时 kill process group</pre>
+    </div>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">声明 ≠ 调度</div>
+        <h3><code>execution_mode</code></h3>
+        <p><code>AgentTool.execution_mode="parallel"</code> 是声明性元数据；当前 <code>run_agent_loop</code> 没有读取它，多个 calls 仍顺序执行。</p>
+      </article>
+      <article class="phase">
+        <div class="label">工具内并发</div>
+        <h3>由具体 executor 实现</h3>
+        <p>bash 的 task 竞争属于工具内部生命周期管理，不代表 loop 会并行调度多个工具。</p>
+      </article>
+    </div>
+
+    <p class="path">src/tau_agent/harness.py:198–202 · src/tau_agent/loop.py:139–158 · src/tau_coding/tools.py:477–498, 609–649, 1019–1029</p>
+  </section>
+
+  <section id="steering">
+    <h2>Steering 与 Follow-up 队列</h2>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">Steering</div>
+        <h3>运行中插入</h3>
+        <p><code>harness.steer(...)</code> 的消息在下一轮工具完成后、下一次 provider 调用前注入，用于及时干预。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Follow-up</div>
+        <h3>自然结束后追加</h3>
+        <p><code>harness.follow_up(...)</code> 在当前 run 自然结束后触发新一轮，用于排队的后续任务。</p>
+      </article>
+    </div>
+
+    <div class="card">
+      <h3>队列排水模式</h3>
+      <pre>queue_mode="one_at_a_time"  → 每轮只取一条
+queue_mode="all"            → 每轮全部取出</pre>
+      <p class="path">src/tau_agent/harness.py:204–217 · src/tau_agent/loop.py:83, 160–166</p>
+    </div>
+
+    <div class="check">
+      <strong>队列不是并行任务：</strong>它们是等待进入同一 loop 的消息，不是同时运行的多个 agent run。
+    </div>
+  </section>
+
+  <section id="events">
+    <h2>事件订阅与背压</h2>
+    <div class="card">
+      <h3>顺序通知，自然背压</h3>
+      <pre>for listener in listeners:
+    result = listener(event)
+    if isawaitable(result):
+        await result</pre>
+      <p>Harness 先逐个等待 listeners，再把同一事件 yield 给主迭代者。async generator 也是拉取式的，因此慢 listener 或慢主消费者都能延迟 loop，最终让 provider stream 暂停推进。</p>
+      <p class="path">src/tau_agent/harness.py:169–196</p>
+    </div>
+  </section>
+
+  <section id="interview">
+    <h2>面试要点</h2>
+    <div class="exercise">
+      <ol>
+        <li><strong>Loop vs Harness：</strong>loop 不拥有跨 run 持久状态，但单次 generator frame 仍有 <code>turn</code>/<code>pending</code>，并修改传入的 <code>messages</code>；Harness 管理跨 run 历史、生命周期、队列、取消和订阅。</li>
+        <li><strong>安全 gate：</strong>授权应优先放在 <code>before_tool_call</code>，而不是 provider 或 renderer；<code>after_tool_call</code> 负责受信任的结果治理。</li>
+        <li><strong>保证与空缺：</strong>标准错误结果和 hooks 是机制，不等于 timeout、租户隔离或进程沙箱；这些仍由 host/execution layer 提供。</li>
+        <li><strong>两种 result：</strong><code>AgentToolResult</code> 是 executor 返回值；<code>ToolResultMessage</code> 是写入消息历史的协议记录。</li>
+        <li><strong>中断修复：</strong>孤儿 call 追加幂等的错误结果，以满足 completeness、auditability 与 replayability；这是补偿，不是重试。</li>
+        <li><strong>顺序执行：</strong>当前 loop 按 <code>for call in calls</code> 顺序执行；<code>execution_mode</code> 未参与调度。</li>
+        <li><strong>背压：</strong>listeners 顺序 await，主路径按 async iterator 拉取；慢消费者会把延迟向 provider 传播。</li>
+      </ol>
+    </div>
+  </section>
+
+  <section>
+    <h2>对应微课</h2>
+    <p><a href="../lessons/0010-loop-vs-harness.html">第 10 节：Loop vs Harness</a> · <a href="../lessons/0011-repair-interrupted-tool-calls.html">第 11 节：中断修复</a> · <a href="../lessons/0012-place-tool-safety-policies.html">第 12 节：工具安全 seam</a></p>
+  </section>
+
+  <footer>本文档是工具执行链和运行时管理的压缩参考。遇到不清楚的地方，沿对应微课回到预测、源码切片和小练习。</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 15 节：一条消息何时真正可恢复？</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 15 · Local recovery · About 15 minutes</div>
+    <h1>一条本地消息何时真正可恢复？</h1>
+    <p class="lede">harness 中出现过不等于已经持久化。Tau 以 <code>MessageEndEvent</code> 为语义边界，把完整消息和新的 active-leaf 指针追加到 JSONL；重启时再从最后一个 leaf 沿 parent 链重放。一个 session = 一个文件，一条消息 = 两行，message id 本身不足以选择历史。</p>
+  </header>
+
+  <nav>
+    <a href="0014-map-local-session-code.html">上一节：代码地图</a>
+    <a href="#predict">先预测</a>
+    <a href="#file">文件模型</a>
+    <a href="#persist">持久化路径</a>
+    <a href="#recover">恢复路径</a>
+    <a href="#window">崩溃窗口</a>
+    <a href="#exercise">日志练习</a>
+    <a href="../reference/durable-session-glossary.md">术语表</a>
+    <a href="../reference/card14-durable-session-log-primary-sources.md">研究资料</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：partial text 算不算 durable？</h2>
+    <div class="exercise">
+      <p>TUI 已经显示 assistant 的增量：</p>
+      <pre>TextDeltaEvent("Hel")
+TextDeltaEvent("lo")
+# 进程在 MessageEndEvent 前退出</pre>
+      <p>重启并 <code>CodingSession.load()</code> 后，历史里是否一定存在 <code>AssistantMessage("Hello")</code>？</p>
+      <p>请用一个判断标准回答，而不是凭“用户已经看到了”判断。</p>
+    </div>
+  </section>
+
+  <section id="file">
+    <h2>3–5 分钟：先建立文件模型</h2>
+    <p class="path">src/tau_coding/session.py:1289, 2657–2661 · src/tau_coding/session_manager.py</p>
+
+    <div class="card">
+      <h3>一个 session = 一个 JSONL 文件</h3>
+      <p>每个 CodingSession 对应一个 <code>.jsonl</code> 文件，路径来自 <code>SessionManager</code> 的索引记录（<code>record.path</code>，由 <code>default_session_path(cwd)</code> 推导）。文件顺序就是写入顺序。</p>
+      <h3>一条消息 = 两行 entry</h3>
+      <pre>MessageEntry 行: {"type":"message","id":"...","parent_id":"...","message":{...canonical 消息...}}
+LeafEntry    行: {"type":"leaf","id":"...","parent_id":"...","entry_id":"..."}</pre>
+      <p>每一行是一个完整 JSON value，树关系完全由 <code>parent_id</code> 隐含。没有任何嵌套。</p>
+    </div>
+
+    <div class="check">
+      <strong>session 归属由文件决定：</strong>消息不存“属于哪个 session”，session 归属由文件路径决定。message 之间靠 <code>parent_id</code> 串成树，active branch 靠 <code>LeafEntry</code> 定位。
+    </div>
+  </section>
+
+  <section id="persist">
+    <h2>5–8 分钟：从完整消息到两条 JSONL entry</h2>
+    <p class="path">src/tau_coding/session.py:1765–1785</p>
+
+    <div class="flow">
+      <div class="node">
+        <strong>MessageEndEvent</strong>
+        <span>loop/harness 已经形成完整、规范化的 user、assistant 或 tool-result 消息。</span>
+      </div>
+      <div class="node">
+        <strong>MessageEntry</strong>
+        <span>把消息 append 到 JSONL，并用 <code>parent_id</code> 连接当前 active path。</span>
+      </div>
+      <div class="node">
+        <strong>LeafEntry</strong>
+        <span>append 新的 active-branch 指针，声明恢复时应从哪一个 entry 向根回放。</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>实际持久化循环</h3>
+      <pre>for message in new_messages:            # new_messages = harness.messages[persisted_count:]
+    entry = MessageEntry(
+        parent_id=self._last_parent_id,   # _last_parent_id 是追加游标
+        message=message,
+    )
+    await storage.append(entry)
+    self._last_parent_id = entry.id
+
+    leaf = LeafEntry(
+        parent_id=entry.id,
+        entry_id=entry.id,
+    )
+    await storage.append(leaf)</pre>
+      <p>每个完整消息对应两次 append：一条内容记录，一条 active-leaf 记录。旧 entry 不会被原地修改。</p>
+    </div>
+
+    <div class="check">
+      <strong>durability boundary：</strong><code>MessageUpdateEvent</code> 服务实时显示；<code>MessageEndEvent</code> 触发 <code>_persist_messages_since()</code>。因此“出现在 TUI”与“可以从 JSONL 恢复”是两个不同事实。
+    </div>
+    <p class="path">注意第 14 节的 append-lag：persist 写的是<strong>上一边界落进 <code>harness.messages</code> 的消息</strong>，不是当前事件。</p>
+  </section>
+
+  <section id="recover">
+    <h2>8–11 分钟：load 不是反序列化一个对象，而是 replay</h2>
+    <p class="path">src/tau_coding/session.py:296–323, 367–380 · tau_agent/session/memory.py:36–103 · tree.py:22–40</p>
+
+    <ol class="steps">
+      <li>
+        <h3>按文件顺序读取全部 entries</h3>
+        <p><code>JsonlSessionStorage.read_all()</code> 把每一行解析成带 <code>type</code>、<code>id</code>、<code>parent_id</code> 和时间戳的 <code>SessionEntry</code>。</p>
+      </li>
+      <li>
+        <h3>找到最后 append 的 <code>LeafEntry</code></h3>
+        <p>它的 <code>entry_id</code> 表示当前 active branch 的尾部。旧 branches 仍留在文件中，但不会自动进入当前 provider context。</p>
+      </li>
+      <li>
+        <h3>从 leaf 沿 parent 链走回 root</h3>
+        <p><code>path_to_entry()</code> 收集 leaf → parent → parent，检测重复 ID、缺失 entry 与 cycle，最后反转成 root-to-leaf 顺序。</p>
+      </li>
+      <li>
+        <h3>把 path reduce 成 <code>SessionState</code></h3>
+        <p><code>SessionState.from_entries()</code> 恢复 messages、model、thinking level、label、compaction 等当前状态。</p>
+      </li>
+      <li>
+        <h3>用恢复后的 messages 新建 harness</h3>
+        <p><code>AgentHarness(..., messages=state.messages)</code> 得到新的进程内工作副本；旧 harness、listener、queue 与 cancellation token 不会复活。</p>
+      </li>
+    </ol>
+
+    <div class="check">
+      <strong>一句话：</strong>JSONL 保存事实，<code>LeafEntry</code> 选择当前历史，reducer 重建状态，harness 承接新的运行时生命周期。
+    </div>
+
+    <div class="card">
+      <h3>为什么 message id 不够？—— LeafEntry 是“选择器”</h3>
+      <p>设想没有 LeafEntry，只有 MessageEntry 的 <code>parent_id</code> 链：文件里 E1→E2→…→E5 天然是<strong>一条线</strong>，你 <code>branch_to_entry("E2")</code> 后，E3/E4/E5 没有任何标记说明它们被抛弃，load 不知道该从 E5 回溯还是从 E2 回溯——分支就丢了。</p>
+      <p>有了 LeafEntry，分支后文件里多一行 <code>LeafEntry(entry_id=E2)</code>，它是<strong>最新</strong>的 leaf；load 找最后一个 leaf → E2 → 回溯 E1→E2。旧分支仍在文件里（可审计），但不在 active path 上。</p>
+      <p><strong>MessageEntry 回答“发生过什么”，LeafEntry 回答“当前进行到哪”。</strong></p>
+    </div>
+  </section>
+
+  <section id="window">
+    <h2>11–13 分钟：两类崩溃窗口</h2>
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">Before MessageEntry</div>
+        <h3>消息只在内存中</h3>
+        <p>partial delta 或尚未持久化的完整消息随进程消失。load 只能恢复旧 leaf 指向的路径。</p>
+      </article>
+      <article class="phase">
+        <div class="label">After MessageEntry, before LeafEntry</div>
+        <h3>内容在日志，指针尚未前移</h3>
+        <p>新 message line 可能存在，但最后的 active leaf 仍指向旧尾部。正常 load 不会把新消息放入当前 transcript；它成为日志中可审计但不在 active path 上的 entry。</p>
+      </article>
+      <article class="phase">
+        <div class="label">After LeafEntry</div>
+        <h3>新 active path 可重放</h3>
+        <p>load 找到最新 leaf 后，可以沿 parent 链恢复新消息并重新构造 harness。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Power loss</div>
+        <h3>当前没有 <code>fsync</code> 保证</h3>
+        <p>storage 使用 append 模式并在上下文退出时关闭文件，但源码没有显式 <code>fsync</code>。因此不能声称日志尾部在断电后一定已进入稳定存储。</p>
+      </article>
+    </div>
+
+    <div class="card">
+      <h3>用 append-lag 解释“Before MessageEntry”窗口</h3>
+      <p>assistant 已经 yield 了 <code>MessageEndEvent</code>，但该消息可能还没被 append 进 <code>harness.messages</code>（append 发生在 <code>loop.py:132</code>，晚于 end event），也就没被 persist。此刻进程退出 → JSONL 里没有它。<code>session.py:1606</code> run 结束后那次 persist 专门捕捉这条“没有后继边界”的消息。</p>
+    </div>
+
+    <p><a href="https://www.sqlite.org/wal.html">SQLite WAL</a> 提供了有用的对照词汇：commit-by-append 与 reopen-and-recover；<a href="https://www.sqlite.org/atomiccommit.html">SQLite Atomic Commit</a> 则说明为什么只有写入而没有同步屏障，不能等同于 power-loss durability。Tau 当前不是 SQLite，这里只借用可靠性概念。</p>
+  </section>
+
+  <section id="exercise">
+    <h2>13–14 分钟：从日志判断恢复结果</h2>
+    <div class="exercise">
+      <p>文件依次包含：</p>
+      <pre>E1  SessionInfoEntry(parent=None)
+E2  MessageEntry(parent=E1, user="hello")
+L2  LeafEntry(entry_id=E2)
+E3  MessageEntry(parent=E2, assistant="hi")
+# 进程在写 L3 前退出</pre>
+      <p>请回答：</p>
+      <ol>
+        <li>最新 <code>LeafEntry</code> 指向谁？</li>
+        <li><code>path_to_entry(...)</code> 会回放哪些 entry？</li>
+        <li>恢复后的 <code>state.messages</code> 包含哪些消息？</li>
+        <li><code>E3</code> 是否从文件中消失？它是否进入 active transcript？</li>
+        <li>如果一个 session 里既有 session_info 又有 label，它们是靠 id 找到对应 message 的吗？</li>
+      </ol>
+    </div>
+
+    <details>
+      <summary>回答后展开参考答案</summary>
+      <p>最新 leaf 是 <code>L2</code>，其 <code>entry_id=E2</code>。恢复路径是 <code>E1 → E2</code>；<code>state.messages</code> 只有 user <code>"hello"</code>。<code>E3</code> 仍在 JSONL 中，但由于没有新的 leaf 将 active branch 指向它，正常 load 不把它放入当前 transcript。</p>
+      <p>第 5 题：<strong>不是。</strong>label 和 session_info 是 parent 链上的状态节点，靠 replay 时“状态覆盖”生效（<code>SessionState</code> 里 <code>label</code> 是最后一个 label 覆盖后的最终值，<code>session_info</code> 是 root 元数据）。它们从不通过 id 查找消息；session 归属由文件本身决定。</p>
+    </details>
+  </section>
+
+  <section id="recap">
+    <h2>14–15 分钟：一句话检索</h2>
+    <blockquote>完整消息在 ______ 事件后被写成 ______ + ______ 两行 entry；重启时从最后一个 ______ 沿 ______ 链 replay，并用恢复的 messages 新建 harness。一个 session = 一个 ______。</blockquote>
+    <p>建议答案关键词：<strong>MessageEndEvent</strong>、<strong>MessageEntry</strong>、<strong>LeafEntry</strong>、<strong>leaf</strong>、<strong>parent_id</strong>、<strong>JSONL 文件</strong>。</p>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p><a href="../src/tau_agent/session/storage.py"><code>tau_agent/session/storage.py:12–42</code></a> 定义 append/read 接口；<a href="../src/tau_agent/session/entries.py"><code>entries.py:25–114</code></a> 定义 durable units；<a href="../src/tau_agent/session/tree.py"><code>tree.py:22–40</code></a> 定义 parent-chain replay；<a href="../src/tau_agent/session/memory.py"><code>memory.py:36–103</code></a> 把 entries reduce 为 state；<a href="../src/tau_coding/session.py"><code>tau_coding/session.py:296–405, 1765–1785</code></a> 连接 load、harness 和持久化边界。外部资料汇总见 <a href="../reference/card14-durable-session-log-primary-sources.md">Card 14 reference</a>。</p>
+  </section>
+
+  <section>
+    <h2>下一微课</h2>
+    <p>第 16 节将只回答“怎样分支”：为什么 Tau 不复制或删除旧日志，而是追加一个新的 <code>LeafEntry</code> 来移动 active branch，以及它与压缩的本质区别。</p>
+  </section>
+
+  <footer>本节只解决本地恢复边界。下一节再进入 parent tree 与 branching，不把三个机制一次塞进工作记忆。</footer>
+</main>
+</body>
+</html>

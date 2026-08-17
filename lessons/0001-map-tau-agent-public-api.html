@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 1 节：tau_agent 对外暴露什么？</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 01 · tau_agent · About 15 minutes</div>
+    <h1><code>tau_agent</code> 对外暴露什么？</h1>
+    <p class="lede">今天不进入 loop 的控制流。先把 <code>tau_agent</code> 看成一个库，找出它向使用者提供的几类能力。</p>
+  </header>
+
+  <nav>
+    <a href="#predict">预测</a>
+    <a href="#read">源码切片</a>
+    <a href="#exercise">分类练习</a>
+    <a href="../reference/architecture-course-map.html">完整路线</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：先预测公共接口</h2>
+    <div class="exercise">
+      <p>假设你要把 <code>tau_agent</code> 当成库，接到另一个应用里。先写下你认为至少需要哪四类对象。</p>
+      <p>提示：暂时不要写 Typer、Textual、文件路径或具体模型供应商。</p>
+    </div>
+  </section>
+
+  <section id="read">
+    <h2>3–10 分钟：只读 <code>__init__.py</code></h2>
+    <p class="path">src/tau_agent/__init__.py:1–68</p>
+    <p>不要跳进被导入的文件。只观察 public facade 导出了哪些名字，并尝试分组。</p>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">Data</div>
+        <h3>消息与内容</h3>
+        <p><code>UserMessage</code>、<code>AssistantMessage</code>、<code>ToolResultMessage</code>、content blocks、usage。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Contract</div>
+        <h3>工具与事件</h3>
+        <p><code>AgentTool</code>、<code>AgentToolResult</code> 与各种 <code>AgentEvent</code>。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Execution</div>
+        <h3>循环与 Harness</h3>
+        <p><code>run_agent_loop</code>、<code>AgentHarness</code>、配置、取消和 queued messages。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Durability</div>
+        <h3>会话原语</h3>
+        <p><code>SessionEntry</code>、<code>SessionState</code>、<code>JsonlSessionStorage</code> 等。</p>
+      </article>
+    </div>
+
+    <div class="check"><strong>观察：</strong><code>tau_agent.__init__</code> 没有导出 CLI、TUI 或本地 read/bash 实现。这是一个边界信号，而不是遗漏。</div>
+  </section>
+
+  <section id="exercise">
+    <h2>10–14 分钟：分类六个对象</h2>
+    <div class="exercise">
+      <p>把下面对象放进“数据、协议、执行、会话”四组：</p>
+      <pre>AssistantMessage
+AgentTool
+AgentEndEvent
+run_agent_loop
+AgentHarness
+SessionState</pre>
+      <p>其中某些对象可以有次要角色，但先选择它最主要的角色。</p>
+    </div>
+
+    <details>
+      <summary>完成后展开参考分类</summary>
+      <ul>
+        <li><strong>数据：</strong><code>AssistantMessage</code></li>
+        <li><strong>协议：</strong><code>AgentTool</code>、<code>AgentEndEvent</code></li>
+        <li><strong>执行：</strong><code>run_agent_loop</code>、<code>AgentHarness</code></li>
+        <li><strong>会话：</strong><code>SessionState</code></li>
+      </ul>
+    </details>
+  </section>
+
+  <section>
+    <h2>14–15 分钟：一句话复述</h2>
+    <blockquote><code>tau_agent</code> 是一个 provider-neutral 的可复用核心，它对外提供 ______、______、______ 和 ______。</blockquote>
+
+    <div class="check">
+      <strong>完成标准：</strong>能说出四组能力，并指出至少两个刻意不属于该包的产品层概念。今天不要求理解任何实现细节。
+    </div>
+
+    <p><strong>下一节：</strong>只研究消息模型——一次“用户提问→模型调用工具→工具返回→模型回答”在历史中长什么样。</p>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p><a href="../src/tau_agent/__init__.py"><code>tau_agent/__init__.py</code></a> 是本节唯一必读源码。遇到不认识的名字先记录，不在本节继续跳转。任何分类不确定，都可以直接问教师。</p>
+  </section>
+
+  <footer>本节的产物是一张模块能力地图，不是对所有类的解释。</footer>
+</main>
+</body>
+</html>

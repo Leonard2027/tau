@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 7 节：tool result 怎样回到模型上下文？</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 07 · tau_agent · About 15 minutes</div>
+    <h1>tool result 怎样回到模型上下文？</h1>
+    <p class="lede">把消息关联与控制流串起来：模型发出 <code>ToolCall</code> → loop 执行 → 结果 <code>ToolResultMessage</code> 写回历史 → 下一轮模型调用时，这条结果作为上下文的一部分发给 provider。</p>
+  </header>
+
+  <nav>
+    <a href="#predict">先预测</a>
+    <a href="#read">源码切片</a>
+    <a href="#exercise">模拟练习</a>
+    <a href="../reference/architecture-course-map.html">完整路线</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：先预测关联与继续</h2>
+    <div class="exercise">
+      <p>你已掌握消息模型（<code>ToolResultMessage.tool_call_id</code>、<code>AssistantMessage.content</code> 里的 <code>ToolCall.id</code>）与 turn 边界。回答：</p>
+      <ol>
+        <li>模型发出 <code>read("readme.md")</code> 的 ToolCall 后，<code>ToolResultMessage</code> 凭什么和那个 ToolCall 对上号？</li>
+        <li><code>AssistantMessage.stop_reason</code> 是 <code>"toolUse"</code> 还是 <code>"stop"</code> 时，loop 会继续执行工具？</li>
+        <li><code>ToolResultMessage</code> 写回 <code>_messages</code> 后，下一轮 provider 凭什么"看到"这条结果？它的 <code>role</code> 是什么？</li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="read">
+    <h2>3–10 分钟：读 tool result 写回历史</h2>
+    <p class="path">src/tau_agent/messages.py:77–85, 170–193</p>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">关联字段</div>
+        <h3><code>ToolCall.id</code> ↔ <code>ToolResultMessage.tool_call_id</code></h3>
+        <p>执行时 loop 把 <code>call.id</code> 原样写进结果消息。provider 端靠这一对 id 把"请求"与"结果"配成一组 tool-use 回合。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Role 是 provider 看的</div>
+        <h3><code>role: "toolResult"</code></h3>
+        <p><code>ToolResultMessage.role</code> 是 provider 识别"这是工具结果"的依据。它与 <code>"user"/"assistant"</code> 并列，构成模型上下文的基本角色。</p>
+      </article>
+    </div>
+
+    <p class="path">src/tau_agent/loop.py:139–157, 225–282</p>
+    <div class="card">
+      <h3>写回动作发生在哪</h3>
+      <pre>calls = list(assistant.tool_calls)
+has_more_tools = bool(calls)              # loop.py:141
+for call in calls:
+    async for event in _execute_tool_call(...):   # loop.py:143
+        yield event
+        if isinstance(event, MessageEndEvent) and isinstance(
+            event.message, ToolResultMessage
+        ):
+            tool_results.append(event.message)     # 本 turn 的结果列表
+            messages.append(event.message)         # 写回持久历史
+            new_messages.append(event.message)     # 写回本次 run 的 delta</pre>
+      <p>关键：<code>_execute_tool_call</code> 在 <code>loop.py:273–282</code> 构造 <code>ToolResultMessage(tool_call_id=call.id, ...)</code> 并发出 <code>MessageStart/EndEvent</code>；loop 捕获后追加到 <code>messages</code>（持久历史）。下一轮 <code>_provider_context(messages)</code> 会把它作为上下文传给 provider。</p>
+    </div>
+
+    <div class="check">
+      <strong>结果为什么能"回到"模型上下文：</strong>不是 provider 主动去查，而是 loop 把结果 <code>append</code> 到 <code>messages</code>，下一次 <code>stream_response(messages=...)</code> 时结果自然携带进去。<code>tool_call_id == ToolCall.id</code> 让 provider/adapter 把它组装成工具回复的协议形态。
+    </div>
+  </section>
+
+  <section id="exercise">
+    <h2>10–14 分钟：模拟一次 read 的两轮对话</h2>
+    <div class="exercise">
+      <p>用户："帮我读 readme.md"。模拟两次模型调用（两个 turn）的完整消息历史与事件流。</p>
+      <p>写出每一条 <code>messages</code> 里的顶层记录（role + 关键字段），并标注 <code>has_more_tools</code> 在两个 turn 后各是什么。</p>
+    </div>
+
+    <details>
+      <summary>回答后展开参考答案</summary>
+      <pre>Turn 1:
+  messages 追加: AssistantMessage(role=assistant, content=[ToolCall(id="c1", name="read", arguments={path:...})], stop_reason="toolUse")
+  has_more_tools = True (因为 calls 非空)
+  → 执行 read, 追加 ToolResultMessage(role=toolResult, tool_call_id="c1", tool_name="read", content=[文件内容], is_error=False)
+
+Turn 2:
+  下一轮 _provider_context 携带上述两条 + 用户消息
+  → 模型看到文件内容, 回复 AssistantMessage(role=assistant, content=[TextContent(总结)], stop_reason="stop")
+  has_more_tools = False
+  → 无更多工具, 无 follow-up → break → AgentEndEvent</pre>
+      <p>关联链：模型请求（<code>c1</code>）→ 执行 → 结果（<code>tool_call_id=c1</code>）→ 下一轮模型看到文件内容并给出总结。</p>
+    </details>
+  </section>
+
+  <section id="recap">
+    <h2>14–15 分钟：一句话检索</h2>
+    <blockquote><code>ToolResultMessage</code> 通过 ______ 与 <code>ToolCall</code> 对上号；写回 <code>messages</code> 后，下一轮 provider 靠它的 ______ 字段识别"这是工具结果"，从而把它作为 ______ 的一部分。<code>has_more_tools</code> 由 assistant 的 ______ 决定。</blockquote>
+
+    <div class="check">
+      <strong>面试表达：</strong>工具结果"回到"模型上下文不是靠特殊通道，而是作为一条普通的历史消息（role=toolResult）被追加，下一次请求时自然携带。请求-结果配对靠 <code>tool_call_id == ToolCall.id</code> 维持，这是 agent 平台保证对话协议完整的核心机制。
+    </div>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p><a href="../src/tau_agent/messages.py"><code>src/tau_agent/messages.py:77–85, 170–193</code></a> 定义关联字段与 role；<a href="../src/tau_agent/loop.py"><code>src/tau_agent/loop.py:139–157, 225–282</code></a> 展示写回动作；<a href="../src/tau_agent/loop.py"><code>src/tau_agent/loop.py:171–186</code></a> 的 <code>_provider_context</code> 决定哪些消息作为上下文发送。</p>
+  </section>
+
+  <section>
+    <h2>下一节</h2>
+    <p>下一张卡片把循环条件整体读一遍：什么时候继续、什么时候停止（正常、错误、超限、follow-up 四条路径）。</p>
+  </section>
+
+  <footer>本节只建立 tool result 的写回与关联，不展开异常恢复（那是 Card 11 的事）。</footer>
+</main>
+</body>
+</html>

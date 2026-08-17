@@ -1,0 +1,3 @@
+# Distinguishes core contracts from product implementations
+
+The learner correctly classified `tau_agent`'s public surface into data (`AssistantMessage`), protocols (`AgentTool`, `AgentEndEvent`), execution (`run_agent_loop`, `AgentHarness`), and session state (`SessionState`). They also correctly identified concrete tools and TUI management as outside the portable core, and understood after clarification that `tau_agent` owns the provider-neutral contract while concrete model connections belong to `tau_ai` and runtime provider selection/assembly belongs to `tau_coding`. This establishes enough understanding to proceed directly to the message model.

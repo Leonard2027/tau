@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tau Agent 后端架构与平台面试路线</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Reference · Agent platform · Core-first · 15 minutes each</div>
+    <h1>从 <code>tau_agent</code> 核心走向 Agent 平台面试</h1>
+    <p class="lede">先快速读懂消息、协议、事件、loop 与 harness，再用 Tau 的真实设计训练可靠性、工具安全、流式架构、状态管理、二次开发和系统设计表达。</p>
+  </header>
+
+  <nav>
+    <a href="../lessons/0001-map-tau-agent-public-api.html">第 1 节</a>
+    <a href="../lessons/0002-understand-agent-messages.html">第 2 节</a>
+    <a href="../lessons/0003-understand-provider-protocol.html">第 3 节</a>
+    <a href="../lessons/0004-understand-tool-protocol.html">第 4 节</a>
+    <a href="../lessons/0005-understand-agent-events.html">第 5 节</a>
+    <a href="../MISSION.md">学习使命</a>
+    <a href="../RESOURCES.md">可信资源</a>
+  </nav>
+
+  <section>
+    <h2>每节固定节奏</h2>
+    <div class="phase-grid">
+      <article class="phase"><div class="label">0–3 min</div><h3>预测</h3><p>先猜责任、输入输出或事件顺序。</p></article>
+      <article class="phase"><div class="label">3–10 min</div><h3>源码切片</h3><p>只读一个抽象或一个控制流片段。</p></article>
+      <article class="phase"><div class="label">10–14 min</div><h3>小练习</h3><p>分类、排序、模拟或画一条边界。</p></article>
+      <article class="phase"><div class="label">14–15 min</div><h3>一句话复述</h3><p>留下一个结论和一个疑问。</p></article>
+    </div>
+  </section>
+
+  <section>
+    <h2>第一部分：<code>tau_agent</code> 可复用核心</h2>
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">01 · Public surface</div>
+        <h3><a href="../lessons/0001-map-tau-agent-public-api.html"><code>tau_agent</code> 对外暴露什么？</a></h3>
+        <p><strong>只读：</strong><code>tau_agent/__init__.py</code></p>
+        <p><strong>练习：</strong>把导出项分成数据、协议、执行、会话四组。</p>
+      </article>
+      <article class="phase">
+        <div class="label">02 · Messages</div>
+        <h3><a href="../lessons/0002-understand-agent-messages.html">一次对话由哪些消息构成？</a></h3>
+        <p><strong>只读：</strong><code>messages.py</code> 的 user、assistant、tool result 模型</p>
+        <p><strong>练习：</strong>排列一次“提问→工具→回答”的消息历史。</p>
+      </article>
+      <article class="phase">
+        <div class="label">03 · Provider protocol</div>
+        <h3><a href="../lessons/0003-understand-provider-protocol.html">核心怎样做到不知道具体模型厂商？</a></h3>
+        <p><strong>只读：</strong><code>provider.py:13–32</code></p>
+        <p><strong>练习：</strong>列出 <code>stream_response()</code> 的输入与输出。</p>
+      </article>
+      <article class="phase">
+        <div class="label">04 · Tool protocol</div>
+        <h3><a href="../lessons/0004-understand-tool-protocol.html">核心眼中的工具是什么？</a></h3>
+        <p><strong>只读：</strong><code>tools.py:21–105</code></p>
+        <p><strong>练习：</strong>区分工具 schema、executor、result 与 renderer。</p>
+      </article>
+      <article class="phase">
+        <div class="label">05 · Events</div>
+        <h3><a href="../lessons/0005-understand-agent-events.html">为什么 loop 不直接操作 UI？</a></h3>
+        <p><strong>只读：</strong><code>events.py:15–87</code></p>
+        <p><strong>练习：</strong>把事件分成 agent、turn、message、tool 四层。</p>
+      </article>
+      <article class="phase">
+        <div class="label">06 · Simple turn</div>
+        <h3><a href="../lessons/0006-understand-simple-turn.html">没有工具调用时，一轮怎样结束？</a></h3>
+        <p><strong>只读：</strong><code>loop.py:44–85</code> 与最终退出路径</p>
+        <p><strong>练习：</strong>排出最短事件序列。</p>
+      </article>
+      <article class="phase">
+        <div class="label">07 · Tool cycle</div>
+        <h3><a href="../lessons/0007-understand-tool-cycle.html">tool result 怎样回到模型上下文？</a></h3>
+        <p><strong>只读：</strong><code>loop.py:109–160, 225–282</code></p>
+        <p><strong>练习：</strong>模拟一次 read 工具调用的两轮对话。</p>
+      </article>
+      <article class="phase">
+        <div class="label">08 · Control flow</div>
+        <h3><a href="../lessons/0008-understand-control-flow.html">循环何时继续，何时停止？</a></h3>
+        <p><strong>只读：</strong><code>loop.py:85–168</code> 的条件与出口</p>
+        <p><strong>练习：</strong>为正常、错误、超限、follow-up 找出路径。</p>
+      </article>
+      <article class="phase">
+        <div class="label">09 · Harness</div>
+        <h3><a href="../lessons/0009-understand-harness.html"><code>AgentHarness</code> 比裸 loop 多了什么？</a></h3>
+        <p><strong>只读：</strong><code>harness.py:61–100, 146–217</code></p>
+        <p><strong>练习：</strong>区分算法状态、生命周期和消息队列。</p>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2>第二部分：Agent 后端 / 平台面试与二次开发</h2>
+    <p>从这里开始把前九节的源码模型用于本地 coding agent 的恢复、日志可观测性与 durable session 设计；分布式平台只作为本地主线掌握后的可选面试外推。</p>
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">10 · Loop vs Harness</div>
+        <h3><a href="../lessons/0010-loop-vs-harness.html">为什么同时需要无状态 loop 与有状态 harness？</a></h3>
+        <p><strong>证据：</strong><code>loop.py:44–168</code> 与 <code>harness.py:61–202</code></p>
+        <p><strong>面试练习：</strong>比较纯 async generator 与状态编排对象的职责、测试性和部署边界。</p>
+      </article>
+      <article class="phase">
+        <div class="label">11 · Reliability</div>
+        <h3><a href="../lessons/0011-repair-interrupted-tool-calls.html">取消或中断后，怎样保持对话协议完整？</a></h3>
+        <p><strong>证据：</strong><code>harness.py:146–190, 219–244</code></p>
+        <p><strong>面试练习：</strong>解释 orphan tool call 为什么必须补成错误结果。</p>
+      </article>
+      <article class="phase">
+        <div class="label">12 · Tool safety</div>
+        <h3><a href="../lessons/0012-place-tool-safety-policies.html">授权、超时、隔离和错误归一化应该放在哪一层？</a></h3>
+        <p><strong>证据：</strong><code>tools.py</code> 与 loop 的 <code>before_tool_call</code>/<code>after_tool_call</code></p>
+        <p><strong>面试练习：</strong>为高风险工具设计最小 policy gate。</p>
+      </article>
+      <article class="phase">
+        <div class="label">13 · Streaming</div>
+        <h3><a href="../lessons/0013-design-replayable-streaming.html">provider stream 怎样沿本地链路到达 extension、session 与 TUI？</a></h3>
+        <p><strong>证据：</strong><code>provider_events.py</code> → <code>events.py</code> → harness → <code>CodingSession</code> → TUI/CLI</p>
+        <p><strong>练习：</strong>追踪一个 delta，区分 extension listener、主迭代路径、增量显示与最终持久化。</p>
+      </article>
+      <article class="phase">
+        <div class="label">14 · State & durability</div>
+        <h3>本地 runtime state 与 durable session log 怎样分工？</h3>
+        <p><strong>证据：</strong><code>harness.py</code> queues/messages 与 <code>session/</code> entries、tree/path replay、branch、compaction</p>
+        <p><strong>微课：</strong><a href="../lessons/0014-map-local-session-code.html">14 · 代码地图与 persist 快照</a> → <a href="../lessons/0015-recover-session-from-jsonl.html">15 · 恢复</a> → <a href="../lessons/0016-branch-without-rewriting-history.html">16 · 分支</a> → <a href="../lessons/0017-compact-without-losing-history.html">17 · 压缩</a></p>
+        <p><strong>速查：</strong><a href="durable-session-glossary.md">Durable session 术语表</a></p>
+        <p><strong>练习：</strong>从 JSONL 日志恢复一条分支，并解释压缩后如何保留可审计历史。</p>
+      </article>
+      <article class="phase">
+        <div class="label">15 · Secondary development · 规划中</div>
+        <h3>怎样在现有 seam 上增加本地恢复或日志可观测性？</h3>
+        <p><strong>实践：</strong>使用 session entries、events、hooks 或 harness 扩展点完成一个小改动及测试。</p>
+        <p><strong>面试产物：</strong>说明为何选择该 seam，以及如何保证日志可恢复、可关联且不耦合 provider/UI。</p>
+      </article>
+      <article class="phase">
+        <div class="label">16 · Mock interview · 规划中</div>
+        <h3>怎样设计一个可恢复、可观测的本地 coding agent？</h3>
+        <p><strong>综合：</strong>provider-neutral loop、工具执行、事件日志、session tree、恢复与压缩；最后可选说明如何扩展到平台。</p>
+        <p><strong>练习：</strong>先完成本地架构陈述与故障恢复追问，再做可选的平台化权衡。</p>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2>主线之外</h2>
+    <p><code>tau_ai</code> 的 Anthropic、OpenAI、Google 等具体 SDK/传输适配，以及 <code>tau_coding</code> 的 Textual/TUI 渲染细节，不进入当前主线。只有当具体二次开发或面试追问需要时，才按需读取相应切片。</p>
+  </section>
+
+  <footer>每次只完成一张卡片。读到支线时先记下，不在当前 15 分钟内继续追。</footer>
+</main>
+</body>
+</html>

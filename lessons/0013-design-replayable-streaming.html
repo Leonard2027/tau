@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 13 节：本地流式事件怎样到达 TUI？</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 13 · Local streaming path · About 15 minutes</div>
+    <h1>本地 coding agent 的流式事件怎样到达 TUI？</h1>
+    <p class="lede">Tau 当前是单机、进程内 coding agent。本节不虚构网络客户端，而是追踪一个 <code>text_delta</code> 从 provider 到 loop、harness、extension、CodingSession，最后到 TUI/CLI 的真实路径。</p>
+  </header>
+
+  <nav>
+    <a href="#predict">先预测</a>
+    <a href="#trace">真实链路</a>
+    <a href="#channels">两条消费路径</a>
+    <a href="#meaning">为什么有意义</a>
+    <a href="#exercise">顺序练习</a>
+    <a href="../reference/architecture-course-map.html">完整路线</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：预测一个 delta 的去向</h2>
+    <div class="exercise">
+      <p>provider 产生：</p>
+      <pre>TextDeltaEvent(
+    content_index=0,
+    delta="Hel",
+    partial=AssistantMessage(...)
+)</pre>
+      <p>请先预测：</p>
+      <ol>
+        <li>loop 会把它原样直接交给 TUI 吗？</li>
+        <li>extension 和 TUI 谁先收到同一个事件？</li>
+        <li>这个 delta 会立即作为一条 durable message 写入 session 吗？</li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="trace">
+    <h2>3–8 分钟：沿产品装配追踪完整路径</h2>
+
+    <div class="card">
+      <h3>1 · Provider → loop</h3>
+      <p class="path">src/tau_agent/provider.py · provider_events.py · loop.py:189–222</p>
+      <pre>provider.stream_response()
+    ↓ TextDeltaEvent(delta="Hel")
+run_agent_loop._assistant_events()
+    ↓ MessageUpdateEvent(
+          message=partial,
+          assistant_message_event=TextDeltaEvent(...)
+      )</pre>
+      <p>loop 没有把某个厂商 SDK 的原始 chunk 直接泄漏给产品层。它把 provider-neutral 的增量事件嵌进稳定的 <code>MessageUpdateEvent</code>。</p>
+    </div>
+
+    <div class="card">
+      <h3>2 · loop → harness</h3>
+      <p class="path">src/tau_agent/harness.py:161–196</p>
+      <pre>async for event in run_agent_loop(...):
+    await self._notify(event)   # 先给本地 extension listener
+    yield event                 # 再给主 async-iterator 消费者</pre>
+      <p>harness 没有向网络发送事件。它只在同一进程内做两件事：同步等待订阅者，然后把事件交给拉取 <code>prompt()</code> 的调用方。</p>
+    </div>
+
+    <div class="card">
+      <h3>3 · harness listener → ExtensionRuntime</h3>
+      <p class="path">src/tau_coding/session.py:367–399 · extensions/runtime.py:489–496, 818–849</p>
+      <pre>CodingSession.load()
+    ↓ harness.subscribe(runtime._on_agent_event)
+ExtensionRuntime._on_agent_event(event)
+    ↓ runtime.emit_event(event)
+extension handlers</pre>
+      <p>这是 harness 的 subscription path。extension 可观察或响应 agent events；由于 harness 会 <code>await</code> listener，慢 extension handler 会延迟后面的主迭代路径。</p>
+    </div>
+
+    <div class="card">
+      <h3>4 · harness yield → CodingSession</h3>
+      <p class="path">src/tau_coding/session.py:1504–1717</p>
+      <pre>persisted_count = len(self._harness.messages)
+events = self._harness.prompt_message(...)
+async for event in events:
+    if isinstance(event, MessageEndEvent):
+        persisted_count = await self._persist_messages_since(persisted_count)
+    ...
+    yield event</pre>
+      <p><code>CodingSession</code> 是主要迭代消费者。<code>MessageEndEvent</code> 只是触发持久化检查；<code>_persist_messages_since()</code> 实际读取的是 <code>harness.messages[persisted_count:]</code> 的积压快照，而不是直接保存当前事件的 <code>message</code>。当前 assistant/tool-result 通常尚未 append，会在后一个边界写入；完整时序见 <a href="0014-map-local-session-code.html#lag">第 14 节的 append-lag</a>。随后 session 继续处理错误、加入 session-owned events，并向产品界面 re-yield。</p>
+    </div>
+
+    <div class="card">
+      <h3>5 · CodingSession → TUI 或 CLI</h3>
+      <p class="path">src/tau_coding/tui/app.py:4510–4686 · tui/adapter.py:24–99 · cli.py:692–766</p>
+      <pre># TUI
+async for event in self.session.prompt(...):
+    self.adapter.apply(event)
+    self._apply_streaming_transcript_event(event)
+
+# print mode
+async for event in session.prompt(prompt):
+    renderer.render(event)</pre>
+      <p>TUI 把事件应用到 <code>TuiState</code> 并更新 transcript widgets；print mode 则把同一 session event 交给 text/JSON/transcript renderer。</p>
+    </div>
+  </section>
+
+  <section id="channels">
+    <h2>8–10 分钟：不要混淆两条本地消费路径</h2>
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">Subscription path</div>
+        <h3>harness → extensions</h3>
+        <p><code>_notify</code> 先顺序等待 listeners。生产装配中主要 listener 是 <code>ExtensionRuntime._on_agent_event</code>。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Iterator path</div>
+        <h3>harness → session → UI</h3>
+        <p>调用方通过 <code>async for</code> 拉取事件。<code>CodingSession</code> 先处理和持久化，再 re-yield 给 TUI 或 CLI。</p>
+      </article>
+    </div>
+
+    <div class="check">
+      <strong>精确顺序：</strong>loop yield → harness 等待 extension listeners → harness yield → CodingSession 处理/re-yield → TUI/CLI 渲染。这里所有箭头都是本地进程内调用。
+    </div>
+  </section>
+
+  <section id="meaning">
+    <h2>10–12 分钟：这层事件设计对本地 Tau 有什么意义？</h2>
+    <ol class="steps">
+      <li>
+        <h3>隔离 provider 与产品界面</h3>
+        <p>TUI 不必理解 Anthropic、OpenAI 或其他 SDK chunk，只理解 Tau 的 <code>AgentEvent</code> 与嵌套的 provider-neutral assistant events。</p>
+      </li>
+      <li>
+        <h3>同一事件支持多种本地产品形态</h3>
+        <p>TUI、print mode、JSON renderer、benchmark 和 extensions 可以使用同一核心事件契约，不需要把显示逻辑塞进 loop。</p>
+      </li>
+      <li>
+        <h3>区分增量显示与最终持久化</h3>
+        <p><code>MessageUpdateEvent</code> 让 UI 实时显示；完整 <code>MessageEndEvent</code> 是 CodingSession 检查持久化的语义边界，但当次写入来自 <code>harness.messages</code> 的 backlog snapshot，不等于直接保存当前事件携带的消息。</p>
+      </li>
+      <li>
+        <h3>看见本地背压的真实来源</h3>
+        <p>慢 extension 会卡在 harness 的 <code>await _notify</code>；慢 TUI/renderer 则会因为 async iterator 是拉取式而延迟请求下一事件。两者都会让 provider stream 暂停推进。</p>
+      </li>
+    </ol>
+  </section>
+
+  <section id="exercise">
+    <h2>12–14 分钟：排出一个 delta 的真实顺序</h2>
+    <div class="exercise">
+      <p>请把下面步骤按实际顺序排列：</p>
+      <ol>
+        <li>TUI adapter 将事件应用到 <code>TuiState</code></li>
+        <li>ExtensionRuntime handler 收到事件</li>
+        <li>provider 产生 <code>TextDeltaEvent("Hel")</code></li>
+        <li>CodingSession 收到并 re-yield 事件</li>
+        <li>loop 产生嵌套该 delta 的 <code>MessageUpdateEvent</code></li>
+        <li>harness 把事件 yield 给主迭代者</li>
+      </ol>
+      <p>再回答：如果 extension handler 处理 5 秒，TUI 何时能看到 <code>"Hel"</code>？</p>
+    </div>
+
+    <details>
+      <summary>回答后展开参考答案</summary>
+      <p>顺序是 3 → 5 → 2 → 6 → 4 → 1。extension path 发生在 harness <code>yield</code> 之前；如果 handler 用时 5 秒，TUI 至少要等这 5 秒后才能收到该事件。</p>
+    </details>
+  </section>
+
+  <section id="recap">
+    <h2>14–15 分钟：一句话检索</h2>
+    <blockquote>provider delta 先被 loop 包成 ______；harness 先通过 ______ 交给 extension，再通过 ______ 交给 CodingSession；最终由 ______ 或 ______ 渲染。</blockquote>
+    <p>建议答案关键词：<strong>MessageUpdateEvent</strong>、<strong>_notify</strong>、<strong>yield</strong>、<strong>TUI</strong>、<strong>CLI renderer</strong>。</p>
+  </section>
+
+  <section>
+    <h2>面试迁移题（明确不是 Tau 当前行为）</h2>
+    <p>只有当面试官要求“把这个本地核心服务化”时，才进一步讨论 WebSocket/SSE、断线、event ID 和 replay。那是把当前事件契约接到远程 transport 的下一步设计，不是对现有 harness 行为的描述。相关一手资料保留在 <a href="../reference/card13-streaming-primary-sources.md">Card 13 streaming research</a> 中，供需要时查阅。</p>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p>本节以 Tau 当前源码为主：<a href="../src/tau_agent/provider_events.py"><code>provider_events.py</code></a>、<a href="../src/tau_agent/events.py"><code>events.py</code></a>、<a href="../src/tau_agent/loop.py"><code>loop.py:189–222</code></a>、<a href="../src/tau_agent/harness.py"><code>harness.py:161–196</code></a>、<a href="../src/tau_coding/session.py"><code>tau_coding/session.py:1504–1717</code></a>、<a href="../src/tau_coding/tui/adapter.py"><code>tui/adapter.py:24–99</code></a> 与 <a href="../src/tau_coding/cli.py"><code>cli.py:692–766</code></a>。</p>
+  </section>
+
+  <section>
+    <h2>下一节</h2>
+    <p><a href="0014-map-local-session-code.html">Card 14</a> 将先建立本地 session 代码地图：harness 的插件订阅路径，怎样与 <code>CodingSession</code> 的持久化路径分开；随后再进入恢复、分支与 compaction。</p>
+  </section>
+
+  <footer>本节只解释 Tau 当前本地事件链。远程 transport 是面试迁移题，不与当前实现混为一谈。</footer>
+</main>
+</body>
+</html>

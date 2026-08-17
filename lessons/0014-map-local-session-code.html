@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 14 节：Tau 的本地 session 代码地图</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 14 · Local session code map · About 15 minutes</div>
+    <h1>Session 是插件 handler 处理出来的吗？持久化又读什么？</h1>
+    <p class="lede">不是。插件和 <code>CodingSession</code> 是 harness 事件的两条消费者路径；真正决定持久化、恢复、分支和压缩的是 <code>CodingSession</code>，它每次从 <code>harness.messages</code> 的积压快照落盘，而 <code>tau_agent.session</code> 提供可复用的数据、存储、路径和 replay 原语。本节建立文件地图并打通“yield 之后怎么变成持久化”。</p>
+  </header>
+
+  <nav>
+    <a href="#predict">先预测</a>
+    <a href="#split">两条事件路径</a>
+    <a href="#snapshot">积压快照</a>
+    <a href="#lag">append-lag</a>
+    <a href="#core">可复用核心</a>
+    <a href="#product">产品编排</a>
+    <a href="#exercise">检索练习</a>
+    <a href="../reference/durable-session-glossary.md">术语表</a>
+    <a href="0015-recover-session-from-jsonl.html">下一节：恢复</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：先判断谁拥有持久化</h2>
+    <div class="exercise">
+      <p>假设把这行代码移除：</p>
+      <pre>extension_runtime.attach_harness_listener(session._harness.subscribe)</pre>
+      <p>请先预测：</p>
+      <ol>
+        <li>插件还能收到 harness 的 agent events 吗？</li>
+        <li><code>CodingSession.prompt()</code> 还能迭代 harness events 吗？</li>
+        <li><code>MessageEndEvent</code> 后还会不会写 <code>MessageEntry</code> 与 <code>LeafEntry</code>？</li>
+        <li>一条 <code>MessageEndEvent</code> 触发持久化时，写的是<strong>当前事件里的那条消息</strong>，还是<strong>别的什么</strong>？</li>
+      </ol>
+      <p>第 4 题是本节的隐藏主线，先凭直觉猜，读完「积压快照」再回来对照。</p>
+    </div>
+  </section>
+
+  <section id="split">
+    <h2>3–5 分钟：harness 后面分成两条本地路径</h2>
+    <p class="path">src/tau_agent/harness.py:161–196 · src/tau_coding/extensions/runtime.py:489–496, 818–849 · src/tau_coding/session.py:367–405, 1575–1606</p>
+
+    <div class="card">
+      <pre>run_agent_loop(...)
+    ↓ AgentEvent
+AgentHarness._run()
+    ├─ await self._notify(event)
+    │      ↓
+    │   ExtensionRuntime._on_agent_event(event)
+    │      ↓
+    │   extension handlers
+    │
+    └─ yield event
+           ↓
+        CodingSession.prompt()
+           ↓ MessageEndEvent
+        _persist_messages_since()
+           ↓
+        MessageEntry + LeafEntry → storage.append</pre>
+    </div>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">Subscription path</div>
+        <h3>插件观察与扩展</h3>
+        <p><code>ExtensionRuntime</code> 通过 <code>harness.subscribe(...)</code> 注册 listener。它把核心 turn events 适配成 extension-facing events，再逐个调用插件 handler。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Iterator path</div>
+        <h3>Session 生命周期编排</h3>
+        <p><code>CodingSession</code> 直接 <code>async for</code> harness。它在完整消息边界执行持久化，并负责 load、branch、compact、provider/runtime refresh。</p>
+      </article>
+    </div>
+
+    <div class="check">
+      <strong>关键结论：</strong>session 不是插件 handler 的产物。插件先收到事件，所以慢 handler 会延迟 <code>CodingSession</code> 收到事件；但 durable transcript 的写入逻辑位于 <code>CodingSession</code>，不位于 extension handler。
+    </div>
+  </section>
+
+  <section id="snapshot">
+    <h2>5–7 分钟：持久化读的是积压快照，不是当前事件</h2>
+    <p class="path">src/tau_coding/session.py:1504–1606, 1765–1785</p>
+
+    <p><code>_persist_messages_since</code> 是持久化的唯一真实写入点。它<strong>从不看事件里的 <code>.message</code></strong>，只看 harness 的内存 transcript 快照：</p>
+
+    <div class="card">
+      <pre># session.py:1772
+new_messages = self._harness.messages[persisted_count:]
+for message in new_messages:
+    entry = MessageEntry(parent_id=self._last_parent_id, message=message)
+    await self._append_session_entry(entry)
+    self._last_parent_id = entry.id
+    leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
+    await self._append_session_entry(leaf)</pre>
+      <p><code>persisted_count</code> 在调用 prompt 前初始化为 <code>len(harness.messages)</code>（<code>session.py:1561</code>），每次 persist 后推进。</p>
+    </div>
+
+    <div class="check">
+      <strong>积压快照模型：</strong>persist 是“把 <code>harness.messages[persisted_count:]</code> 里新增的消息成批落盘”，而不是“处理当前事件”。它滞后一拍、成批、从 messages 取快照。三个相关指针：
+      <ul>
+        <li><code>harness.messages</code> — 运行时 transcript（唯一数据源）</li>
+        <li><code>_last_parent_id</code> — 追加游标：下一条新 entry 的 parent</li>
+        <li><code>persisted_count</code> — 已持久化到第几条，下次从它之后继续</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="lag">
+    <h2>7–10 分钟：append-lag —— 消息进入 messages 晚于它自己的 MessageEndEvent</h2>
+    <p class="path">src/tau_agent/loop.py:60–168, 189–220, 225–283</p>
+
+    <p>这是最容易理解反的地方。loop 里，消息 append 进 <code>messages</code> 的时刻，<strong>晚于</strong>它自己的 <code>MessageEndEvent</code>：</p>
+    <ul>
+      <li>assistant 消息：<code>loop.py:132</code> 的 <code>messages.append(assistant)</code> 发生在 <code>_assistant_events</code> 整个消费完<strong>之后</strong>；而 <code>MessageEndEvent</code> 是 <code>_assistant_events</code> 先 yield 出来的（<code>loop.py:213/217</code>）。</li>
+      <li>tool result 消息：<code>_execute_tool_call</code> 先 <code>yield MessageEndEvent</code>（<code>loop.py:282</code>），<strong>之后</strong>才在 <code>loop.py:155</code> <code>messages.append(...)</code>。</li>
+    </ul>
+
+    <div class="card">
+      <h3>一次 user → assistant(带工具) → tool result → assistant 的完整时间线</h3>
+      <table>
+        <thead>
+          <tr><th>时刻</th><th><code>harness.messages</code></th><th>触发点</th><th>persist 实际写入</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>prompt 进入</td><td><code>[user]</code></td><td><code>loop.py:62</code> extend</td><td>—</td></tr>
+          <tr><td>MessageEnd(user)</td><td><code>[user]</code></td><td><code>session.py:1580</code></td><td><strong>user</strong></td></tr>
+          <tr><td>MessageEnd(assistant1)</td><td><code>[user]</code></td><td>同上</td><td><strong>（0 条，assistant1 还没 append）</strong></td></tr>
+          <tr><td>append assistant1</td><td><code>[user, assistant1]</code></td><td><code>loop.py:132</code></td><td>—</td></tr>
+          <tr><td>MessageEnd(tool1)</td><td><code>[user, assistant1]</code></td><td>同上</td><td><strong>assistant1</strong></td></tr>
+          <tr><td>append tool1</td><td><code>[user, assistant1, tool1]</code></td><td><code>loop.py:155</code></td><td>—</td></tr>
+          <tr><td>MessageEnd(assistant2)</td><td><code>[user, assistant1, tool1]</code></td><td>同上</td><td><strong>tool1</strong></td></tr>
+          <tr><td>append assistant2</td><td><code>[..., assistant2]</code></td><td><code>loop.py:132</code></td><td>—</td></tr>
+          <tr><td>run 结束</td><td>—</td><td><code>session.py:1606</code> 最终 persist</td><td><strong>assistant2</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="check">
+      <strong>为什么每条都“晚一个边界”：</strong>JSONL 最终顺序完全正确（user, assistant1, tool1, assistant2），但每条都在它自己的 <code>MessageEndEvent</code> 的<strong>下一个</strong>边界才写入。<code>session.py:1606</code> run 结束后的那次 persist <strong>不是保险措施，是必需的</strong>——它专门捕捉最后一条没有后继边界的消息。
+    </div>
+  </section>
+
+  <section id="core">
+    <h2>10–12 分钟：先读 <code>tau_agent.session</code> 的可复用核心</h2>
+    <p>不要一上来从两千多行的 <code>tau_coding/session.py</code> 顶部往下读。先按下面顺序掌握五个原语，再看产品层怎样把它们组装起来。</p>
+
+    <ol class="steps">
+      <li>
+        <h3><a href="../src/tau_agent/session/__init__.py"><code>session/__init__.py</code></a>：公开地图入口</h3>
+        <p class="path">src/tau_agent/session/__init__.py:1–50</p>
+        <p>只看 exports，先知道 session 包对外提供哪些 entry、storage、JSONL、tree 与 state 原语。它适合作为目录，不负责机制。</p>
+      </li>
+      <li>
+        <h3><a href="../src/tau_agent/session/entries.py"><code>entries.py</code></a>：durable nouns</h3>
+        <p class="path">src/tau_agent/session/entries.py:25–114</p>
+        <p>定义日志里可以出现什么：message、model/thinking change、compaction、branch summary、label、leaf、session info、custom。所有 entry 共享 <code>id</code>、<code>parent_id</code>、<code>timestamp</code>。</p>
+      </li>
+      <li>
+        <h3><a href="../src/tau_agent/session/storage.py"><code>storage.py</code></a>：append/read port</h3>
+        <p class="path">src/tau_agent/session/storage.py:12–42</p>
+        <p><code>SessionStorage</code> 只有 <code>append(entry)</code> 与 <code>read_all()</code>。<code>JsonlSessionStorage</code> 是本地实现。因此“把 JSONL 换成 SQLite”首先是替换这个 port 的实现，而不是改 harness。</p>
+      </li>
+      <li>
+        <h3><a href="../src/tau_agent/session/jsonl.py"><code>jsonl.py</code></a>：wire format 与旧数据迁移边界</h3>
+        <p class="path">src/tau_agent/session/jsonl.py:12–111</p>
+        <p>负责一条 entry 与一行 JSON 之间的转换；读取旧 Tau-v1 message 时，也在这里迁移成当前 canonical shape。运行时模型不承担历史兼容。</p>
+      </li>
+      <li>
+        <h3><a href="../src/tau_agent/session/tree.py"><code>tree.py</code></a>：选择一条 ancestry path</h3>
+        <p class="path">src/tau_agent/session/tree.py:12–40</p>
+        <p><code>entries_by_id()</code> 建索引并拒绝重复 ID；<code>path_to_entry()</code> 从 leaf 沿 <code>parent_id</code> 回到 root，检测缺失 parent 与 cycle，再反转成 root-to-leaf。</p>
+      </li>
+      <li>
+        <h3><a href="../src/tau_agent/session/memory.py"><code>memory.py</code></a>：纯 replay reducer</h3>
+        <p class="path">src/tau_agent/session/memory.py:21–136</p>
+        <p><code>SessionState.from_entries()</code> 把“全部 entries 或指定 path”reduce 成当前 messages、model、thinking level、label、active leaf 与 compaction state。这里不执行工具、不调用插件，也不管理 UI。</p>
+      </li>
+    </ol>
+
+    <div class="check">
+      <strong>portable core 的边界：</strong><code>entries.py</code> 定义事实，<code>storage.py</code> 保存/读取事实，<code>jsonl.py</code> 定义持久化格式，<code>tree.py</code> 选择事实路径，<code>memory.py</code> 把路径解释成当前状态。
+    </div>
+  </section>
+
+  <section id="product">
+    <h2>12–14 分钟：再按职责切片读 <code>tau_coding</code></h2>
+
+    <div class="card">
+      <h3>1 · <code>CodingSession.load()</code>：恢复并装配新 runtime</h3>
+      <p class="path">src/tau_coding/session.py:296–405</p>
+      <p>读取 entries，找最新 leaf，replay 成 <code>SessionState</code>，用 <code>state.messages</code> 新建 <code>AgentHarness</code>，持久化 interrupted-tool repairs，最后绑定 extension runtime。注意顺序：先恢复 state/harness，后绑定插件 listener。</p>
+    </div>
+
+    <div class="card">
+      <h3>2 · <code>prompt()</code> + <code>_persist_messages_since()</code>：决定何时 durable</h3>
+      <p class="path">src/tau_coding/session.py:1504–1606, 1765–1785</p>
+      <p><code>prompt()</code> 消费 harness iterator。每当看到完整的 <code>MessageEndEvent</code>，它调用 <code>_persist_messages_since()</code>，为 <code>harness.messages[persisted_count:]</code> 里的新消息依次 append <code>MessageEntry</code> 和 <code>LeafEntry</code>（积压快照模型，见上一节）。</p>
+    </div>
+
+    <div class="card">
+      <h3>3 · <code>branch_to_entry()</code> 与 compaction：移动 active leaf 并替换 harness messages</h3>
+      <p class="path">src/tau_coding/session.py:503–567, 1410–1421, 1961–2085</p>
+      <p>分支可选生成 <code>BranchSummaryEntry</code>，append 新 <code>LeafEntry</code>，按目标 path replay state，再调用 <code>harness.replace_messages(state.messages)</code>。压缩 append <code>CompactionEntry</code> + <code>LeafEntry</code>，replay 时替换旧消息。两者都不删除旧日志。</p>
+    </div>
+
+    <div class="card">
+      <h3>4 · <code>session_manager.py</code>：resume 列表，不是 transcript</h3>
+      <p class="path">src/tau_coding/session_manager.py:15–180</p>
+      <p>维护 session ID、JSONL path、cwd、model、title、更新时间等索引元数据。它回答“有哪些 session、文件在哪里”，不负责从 transcript log 恢复 messages。</p>
+    </div>
+  </section>
+
+  <section id="exercise">
+    <h2>14–15 分钟：只回答“先看哪里 + persist 写什么”</h2>
+    <div class="exercise">
+      <p>设当前正处于一个 tool cycle：<code>_execute_tool_call</code> 刚把 <code>MessageEnd(tool1)</code> yield 给 CodingSession，CodingSession 正在处理它。此前 prompt 已经持久化，这是<strong>第一个</strong>工具调用。此时 <code>harness.messages = [user, assistant1]</code>。</p>
+      <ol>
+        <li>此刻 <code>harness.messages</code> 里有哪几条消息？tool1 在不在？</li>
+        <li>这一次 <code>_persist_messages_since</code> 会往 JSONL 写哪几条消息？为什么不是 tool1？</li>
+        <li>新增一种 durable entry 类型，先看哪里？</li>
+        <li>把本地 JSONL 存储替换成 SQLite，主要实现哪个 port？</li>
+        <li>根据 active leaf 恢复 root-to-leaf path，在哪里？把 path reduce 成 messages/model/compaction state，在哪里？</li>
+        <li>决定何时 persist、branch、compact，并重建 harness，在哪里？</li>
+        <li>插件 handler 和 session 持久化之间是什么关系：生产者，还是同一 harness event 的另一条消费者路径？</li>
+      </ol>
+    </div>
+
+    <details>
+      <summary>回答后展开参考答案</summary>
+      <ol>
+        <li><code>[user, assistant1]</code>。tool1 还没被 append 进 <code>messages</code>（它在 <code>loop.py:155</code> 才追加，晚于它自己的 <code>MessageEndEvent</code>）。</li>
+        <li>写 <strong>assistant1</strong>。因为 persist 只读 <code>messages[persisted_count:]</code> 的积压快照，此刻 assistant1 是唯一已落进 messages 的新消息；tool1 连 messages 都还没进。这就是“滞后一拍、成批、快照”模型。</li>
+        <li><code>tau_agent/session/entries.py</code>；随后检查 union、serialization 与 replay 是否需要适配。</li>
+        <li><code>storage.py</code> 的 <code>SessionStorage</code> port。</li>
+        <li><code>tree.py:path_to_entry()</code>；<code>memory.py:SessionState.from_entries()</code>。</li>
+        <li><code>tau_coding/session.py:CodingSession</code> 的对应职责切片。</li>
+        <li>另一条消费者路径。插件先经 <code>_notify</code> 收到事件，<code>CodingSession</code> 随后经 harness iterator 收到事件并自行持久化。</li>
+      </ol>
+    </details>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p><a href="../src/tau_coding/session.py"><code>tau_coding/session.py:1504–1606, 1765–1785</code></a> 的 prompt 与 <code>_persist_messages_since</code>；<a href="../src/tau_agent/loop.py"><code>tau_agent/loop.py:60–168, 189–220, 245–283</code></a> 的消息 append 与 end-event 时序；<a href="../src/tau_agent/session/storage.py"><code>storage.py:12–42</code></a> 的 append/read 接口。外部资料汇总见 <a href="../reference/card14-durable-session-log-primary-sources.md">Card 14 reference</a>。</p>
+  </section>
+
+  <section>
+    <h2>下一微课</h2>
+    <p>代码地图与 persist 机制掌握后，再进入 <a href="0015-recover-session-from-jsonl.html">第 15 节：一条消息何时真正可恢复？</a>。届时用 append-lag 重新解释“Before MessageEntry”崩溃窗口。</p>
+  </section>
+
+  <footer>本节只建立 session 代码地图、ownership 和 persist 的积压快照模型。恢复、分支与压缩分别在后续微课展开。</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 16 节：怎样分支而不破坏历史？</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 16 · Local branching · About 15 minutes</div>
+    <h1>怎样分支而不破坏历史？</h1>
+    <p class="lede">分支不复制、不删除、不重写任何旧行。Tau 只做一件事：追加一条指向旧 entry 的 <code>LeafEntry</code>，把 active pointer 移到树中更早的位置。旧尾巴留在文件里，可审计但不在当前路径上。这条链被切断——这正是它与压缩（不断链）的本质区别。</p>
+  </header>
+
+  <nav>
+    <a href="0015-recover-session-from-jsonl.html">上一节：恢复</a>
+    <a href="#predict">先预测</a>
+    <a href="#branch">branch 源码</a>
+    <a href="#targets">三种目标</a>
+    <a href="#audit">审计轨迹</a>
+    <a href="#vs-compaction">vs 压缩</a>
+    <a href="#exercise">日志练习</a>
+    <a href="../reference/durable-session-glossary.md">术语表</a>
+    <a href="../reference/card14-durable-session-log-primary-sources.md">研究资料</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：要移动 active branch，文件里会发生什么？</h2>
+    <div class="exercise">
+      <p>JSONL 里已经积累了一条历史尾巴：</p>
+      <pre>E1  SessionInfoEntry(parent=None)
+E2  MessageEntry(parent=E1, user="hi")
+L2  LeafEntry(entry_id=E2)
+E3  MessageEntry(parent=E2, assistant="retry")
+E4  MessageEntry(parent=E3, user="do it differently")
+L4  LeafEntry(entry_id=E4)</pre>
+      <p>用户调用 <code>branch_to_entry("E2")</code>，想回到 E2 重新开始。</p>
+      <p>请预测：这次调用会<strong>往文件里追加几行</strong>？每行是什么？E3、E4、L4 那几行会怎样？</p>
+      <p>判断标准：追加式日志的写法边界——不修改已存在的行。</p>
+    </div>
+  </section>
+
+  <section id="branch">
+    <h2>3–7 分钟：<code>branch_to_entry</code> 的骨架</h2>
+    <p class="path">src/tau_coding/session.py:503–567</p>
+
+    <div class="card">
+      <h3>完整分支路径（简化）</h3>
+      <pre>async def branch_to_entry(self, entry_id, *, summarize=False, ...):
+    if self._harness.is_running:
+        raise RuntimeError(TREE_RUNNING_MESSAGE)      # 运行中禁止分支
+    entries = await self._read_session_entries()
+    selected_entry = by_id[entry_id]
+    if not _is_branchable_tree_entry(selected_entry):
+        raise ValueError(...)                          # 只接受 user/assistant/compaction/branch_summary
+
+    target_id = entry_id
+    input_prefill = None
+    if summarize and abandoned_messages:
+        summary_entry = BranchSummaryEntry(parent_id=entry_id, ...)
+        await self._append_session_entry(summary_entry)
+        target_id = summary_entry.id
+    elif selected_entry 是 UserMessage:
+        target_id = selected_entry.parent_id           # 回退到这条 user 消息之前
+        input_prefill = selected_entry.message.text    # 并把原话预填给用户重发
+
+    leaf = LeafEntry(parent_id=target_id, entry_id=target_id)
+    await self._append_session_entry(leaf)             # 唯一的写入：一条新 leaf
+
+    self._last_parent_id = target_id                   # 之后的追加从这里继续
+    await self._refresh_persisted_state(leaf_id=target_id)
+    self._harness.replace_messages(self._state.messages)</pre>
+      <p>注意 <code>LeafEntry</code> 的 <code>entry_id</code> 指向 <code>target_id</code>——active branch 的尾部被移回到树中更早的某个 entry，而那一行 entry 从未被改动。</p>
+    </div>
+
+    <div class="check">
+      <strong>写入边界：</strong>整条分支路径只 <code>append</code>（可能先追加一条 summary，最后必追加一条 <code>LeafEntry</code>）。没有任何复制或改写。
+    </div>
+  </section>
+
+  <section id="targets">
+    <h2>7–10 分钟：三种目标解析，行为各不相同</h2>
+
+    <div class="flow">
+      <div class="node">
+        <strong>summarize=True + 有被抛弃消息</strong>
+        <span>把分支点之后的 active-path 消息压缩成 <code>BranchSummaryEntry</code>，target = summary 的 id，后续重放时以一段摘要代替丢失的细节。</span>
+      </div>
+      <div class="node">
+        <strong>选中 UserMessage（默认）</strong>
+        <span>target = 这条 user 消息的 <code>parent_id</code>，即回退到“这一轮之前”；<code>input_prefill</code> 带回原话，用户重新提问。</span>
+      </div>
+      <div class="node">
+        <strong>其余情况</strong>
+        <span>target = entry_id 本身（assistant 消息、compaction、branch_summary 等），新的 active path 从该点继续。</span>
+      </div>
+    </div>
+
+    <p>被抛弃的消息由 <code>_messages_after_entry_on_active_path(entries, entry_id, self._last_parent_id)</code> 计算：它沿当前 leaf 的 parent 链找出分支点之后的全部消息（<code>session.py:2293–2310</code>）。</p>
+
+    <div class="check">
+      <strong>细节：</strong>分支到一条 <code>UserMessage</code> 并不等于“保留这条 user 消息”。它默认回退到该消息<strong>之前</strong>，并把原文预填给用户重发——所以这里的语义是“回到那一轮之前重来”，而不是“把这一轮设为起点”。
+    </div>
+  </section>
+
+  <section id="audit">
+    <h2>10–12 分钟：旧尾巴去哪了？</h2>
+
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">文件层面</div>
+        <h3>旧行原封不动</h3>
+        <p>E3、E4、L4 依然在 JSONL 里，时间戳和顺序都不变。追加式日志从不收缩。</p>
+      </article>
+      <article class="phase">
+        <div class="label">重放层面</div>
+        <h3>新 leaf 选择路径</h3>
+        <p><code>path_to_entry(entries, new_leaf_id)</code> 从新 leaf 沿 parent 链走回根，只包含 root → target 上的 entry；旧尾巴不在其中。</p>
+      </article>
+      <article class="phase">
+        <div class="label">运行时层面</div>
+        <h3>harness 获得新工作副本</h3>
+        <p><code>SessionState.from_entries(entries, leaf_id=target_id)</code> 重建 messages，<code>harness.replace_messages(...)</code> 换掉旧 transcript。</p>
+      </article>
+      <article class="phase">
+        <div class="label">两个指针</div>
+        <h3><code>_last_parent_id</code> vs <code>active_leaf_id</code></h3>
+        <p><code>_last_parent_id</code> 是<strong>追加游标</strong>：下一条新 entry 的 parent。leaf 里的 <code>entry_id</code> 是<strong>重放锚点</strong>：load/refresh 时从它回溯。分支同时更新两者。</p>
+      </article>
+    </div>
+
+    <p>这正是 Git 的分支模型：历史是父指针链，分支只是把“当前指针”移到已有提交上，旧提交永远留在对象库里。对照阅读 <a href="https://git-scm.com/book/en/v2/Git-Branching-Branches-in-a-Nutshell">Pro Git — Branches in a Nutshell</a>。SQLite WAL 的 commit-by-append 也共享同一思想：<a href="https://www.sqlite.org/wal.html">SQLite WAL</a>。</p>
+  </section>
+
+  <section id="vs-compaction">
+    <h2>12–13 分钟：分支 vs 压缩——一个切断链，一个不断链</h2>
+    <p>这是最容易混淆的地方，也是面试常问的对比。两者都用“append + 移动 leaf”，但语义完全不同：</p>
+
+    <div class="card">
+      <table>
+        <thead>
+          <tr><th></th><th>分支 <code>branch_to_entry</code></th><th>压缩 <code>CompactionEntry</code></th></tr>
+        </thead>
+        <tbody>
+          <tr><td>新 leaf 指向</td><td><strong>过去的某个 entry</strong>（如 E2）</td><td>新 append 的 C</td></tr>
+          <tr><td>parent 链</td><td><strong>被切断</strong>——E3/E4/E5 从此不在新 leaf 的祖先链上，成为孤儿分支</td><td><strong>没切断</strong>——C 的 parent 指回最后一条消息 En，旧消息仍在链上</td></tr>
+          <tr><td>旧消息命运</td><td>从 active path 上消失，变成可审计的孤立分支</td><td>仍在 active path 的链上，只是 reducer 输出时被替换成 summary</td></tr>
+          <tr><td>触发</td><td>用户显式调用</td><td>自动（超阈值）/ 溢出 / 手动</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="check">
+      <strong>一句话：</strong>分支 = 把 leaf 移到过去，<strong>切断链</strong>，旧分支成了孤儿；压缩 = leaf 移到新追加的 CompactionEntry 上，<strong>链不断</strong>，旧消息仍可回溯，只是 <code>state.messages</code> 输出时被替换。
+    </div>
+  </section>
+
+  <section id="exercise">
+    <h2>13–14 分钟：从日志判断分支结果</h2>
+    <div class="exercise">
+      <p>继续使用本页开头的文件，调用 <code>branch_to_entry("E2", summarize=False)</code>：</p>
+      <pre>E1  SessionInfoEntry(parent=None)
+E2  MessageEntry(parent=E1, user="hi")
+L2  LeafEntry(entry_id=E2)
+E3  MessageEntry(parent=E2, assistant="retry")
+E4  MessageEntry(parent=E3, user="do it differently")
+L4  LeafEntry(entry_id=E4)</pre>
+      <p>请回答：</p>
+      <ol>
+        <li>target 最终解析成哪个 id？为什么不是 E2 本身？</li>
+        <li>文件新增了哪一行？它的 <code>parent_id</code> 和 <code>entry_id</code> 分别是什么？</li>
+        <li>重放后 <code>state.messages</code> 里有哪些消息？（提示：active path 从哪到哪）</li>
+        <li>E3、E4、L4 是否还在文件里？它们是否出现在新的 active transcript 中？</li>
+        <li>下一轮用户提问后，<code>_last_parent_id</code> 指向谁？新 MessageEntry 的 parent 是谁？</li>
+      </ol>
+    </div>
+
+    <details>
+      <summary>回答后展开参考答案</summary>
+      <p><strong>1.</strong> target = <code>E1</code>。因为 E2 是 <code>UserMessage</code>，默认分支会回退到它的 parent（E1），并把 <code>"hi"</code> 作为 <code>input_prefill</code> 交还用户重发。</p>
+      <p><strong>2.</strong> 新增一行 <code>LeafEntry(parent_id=E1, entry_id=E1)</code>。唯一的新行，没有任何旧行被改写。</p>
+      <p><strong>3.</strong> <code>path_to_entry</code> 走 <code>E1</code>，active path 上没有任何 message，所以 <code>state.messages</code> 为空。</p>
+      <p><strong>4.</strong> 仍在文件里，且顺序不变；但它们不在新 leaf 的 parent 链上，所以不会进入当前 transcript。</p>
+      <p><strong>5.</strong> <code>_last_parent_id = E1</code>；新 <code>MessageEntry</code> 的 parent 是 <code>E1</code>。于是树里出现两个后代分支：旧尾巴 E2→E3→E4，和新路径 E1→新消息。</p>
+    </details>
+  </section>
+
+  <section id="recap">
+    <h2>14–15 分钟：一句话检索</h2>
+    <blockquote>分支不复制、不删除任何旧行，只追加一条 ______ 来把 active pointer 移到树中更早的 ______；被抛弃的消息留在文件里，成为 ______ 但不在当前 ______ 上。与压缩不同，分支 ______ 了 parent 链。</blockquote>
+    <p>建议答案关键词：<strong>LeafEntry</strong>、<strong>entry</strong>、<strong>可审计</strong>、<strong>active path</strong>、<strong>切断</strong>。副线索：分支到 UserMessage 时，目标回退到它的 ______（答案：parent_id）。</p>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p><a href="../src/tau_coding/session.py"><code>tau_coding/session.py:489–567</code></a> 的 tree picker 与 <code>branch_to_entry</code>；<a href="../src/tau_agent/session/entries.py"><code>entries.py:79–83</code></a> 定义 <code>LeafEntry</code> 与 <code>BranchSummaryEntry</code>；<a href="../src/tau_agent/session/tree.py"><code>tree.py:22–40</code></a> 定义 parent-chain replay；<a href="../src/tau_agent/session/memory.py"><code>memory.py:36–136</code></a> 把 path reduce 为 state，并把 branch summary 还原成一条以 <code>The following is a summary of a branch...</code> 开头的 user 消息。外部资料汇总见 <a href="../reference/card14-durable-session-log-primary-sources.md">Card 14 reference</a>。</p>
+  </section>
+
+  <section>
+    <h2>下一微课</h2>
+    <p>第 17 节将只回答“怎样压缩”：为什么 <code>CompactionEntry</code> 不删除任何旧行、不断链，而是追加一条摘要并在 replay 时替换若干 message entry；以及增量压缩如何避免旧摘要被反复压缩。</p>
+  </section>
+
+  <footer>本节只解决“移动 active pointer”与它和压缩的区别。下一节再进入 compaction 的替换语义。</footer>
+</main>
+</body>
+</html>

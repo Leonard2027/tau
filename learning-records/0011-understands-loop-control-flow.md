@@ -1,0 +1,7 @@
+# Understands loop control flow: the four exit paths
+
+The learner completed Card 08 (control flow) by mapping all four exit paths correctly on the first pass: C (break) for a normal text answer with no follow-up, A (max_turns return) for tool-overrun, B (return) for model error/aborted, D (continue) for follow-up opening a new turn. Earlier in the card they initially flattened A and B into "both error", and were corrected on the precise distinction: in path A the loop itself synthesizes an AssistantMessage(stop_reason="error", error_message=...) because the turn count exceeded the external safety cap, whereas in path B the error is the model's own error/aborted message reused verbatim. A is an externally-imposed cutoff (predictable, set by the caller), B is an internal provider failure (unpredictable). Both terminate immediately without re-checking follow-ups.
+
+This closes the control-flow picture begun in Cards 06 and 07: has_more_tools (model-driven), follow_ups (product-driven), and max_turns (external safety cap) are three independent mechanisms deciding whether the loop continues, with error and max_turns as immediate-termination paths.
+
+Implications: the pure loop is now fully mapped — events, turn boundaries, tool write-back, and exit paths. Ready for Card 09 (AgentHarness: what stateful orchestration the loop's host adds — lifecycle, queues, message history), which the learner can now approach as "the loop is stateless; the harness owns the state", then pivot to the interview-focused Cards 10+.

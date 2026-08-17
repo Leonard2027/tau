@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 11 节：中断后怎样保持工具协议完整？</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Micro lesson 11 · Reliability · About 15 minutes</div>
+    <h1>取消后，为什么必须修复孤儿工具调用？</h1>
+    <p class="lede">当 assistant 已经产生 tool call，但取消发生在 tool result 写回之前，历史中会留下一个未闭合的协议请求。Tau 不删除历史，也不擅自重试工具，而是追加一条可关联、可重放的错误结果。</p>
+  </header>
+
+  <nav>
+    <a href="#predict">先预测</a>
+    <a href="#trace">对象追踪</a>
+    <a href="#invariant">协议不变量</a>
+    <a href="#exercise">可靠性练习</a>
+    <a href="../reference/architecture-course-map.html">完整路线</a>
+  </nav>
+
+  <section id="predict">
+    <h2>0–3 分钟：选择恢复策略</h2>
+    <div class="exercise">
+      <p>当前消息历史已经持久化：</p>
+      <pre>UserMessage("Read README.md")
+AssistantMessage(
+    text="I'll read it",
+    tool_calls=[ToolCall(id="call-1", name="read", ...)]
+)
+# 此时用户取消；call-1 没有 ToolResultMessage</pre>
+      <p>下一次 <code>continue_()</code> 或新 prompt 开始前，host 应该怎么处理？</p>
+      <ol>
+        <li>删除包含 tool call 的 assistant 消息</li>
+        <li>自动重新执行 <code>read</code> 工具</li>
+        <li>追加与 <code>call-1</code> 关联的错误结果</li>
+        <li>什么都不做，让 provider 自己判断</li>
+      </ol>
+      <p>先选一个，再回答：你的策略在“工具具有外部副作用”时是否仍然安全？</p>
+    </div>
+  </section>
+
+  <section id="trace">
+    <h2>3–8 分钟：追踪 <code>call-1</code> 的补偿记录</h2>
+    <p class="path">src/tau_agent/harness.py:146–190, 219–244</p>
+
+    <div class="flow">
+      <div class="node">
+        <strong>AssistantMessage</strong>
+        <span>历史中已存在 <code>ToolCall(id="call-1")</code>，代表模型请求执行工具。</span>
+      </div>
+      <div class="node">
+        <strong>Cancellation</strong>
+        <span>运行结束或进程恢复时，历史里尚无相同 ID 的结果。</span>
+      </div>
+      <div class="node">
+        <strong>ToolResultMessage</strong>
+        <span>追加 <code>tool_call_id="call-1"</code>、<code>is_error=True</code> 的中断结果。</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>修复算法</h3>
+      <pre>returned_ids = {
+    result.tool_call_id
+    for result in messages
+    if isinstance(result, ToolResultMessage)
+}
+
+for assistant in messages:
+    for call in assistant.tool_calls:
+        if call.id not in returned_ids:
+            messages.append(
+                ToolResultMessage(
+                    tool_call_id=call.id,
+                    tool_name=call.name,
+                    content="Tool call interrupted by user",
+                    is_error=True,
+                )
+            )</pre>
+      <p>关联键仍是前面课程学过的不变量：<code>ToolResultMessage.tool_call_id == ToolCall.id</code>。</p>
+    </div>
+
+    <div class="check">
+      <strong>这是补偿，不是重试：</strong>修复记录只声明“这次调用没有成功完成”。它不会再次执行工具，因此不会重复发送邮件、扣款、写文件或触发部署。
+    </div>
+  </section>
+
+  <section id="invariant">
+    <h2>8–10 分钟：可靠性不变量</h2>
+    <div class="phase-grid">
+      <article class="phase">
+        <div class="label">Completeness</div>
+        <h3>每个 call 都有终态</h3>
+        <p>对历史中的每个 <code>ToolCall.id</code>，都应能找到对应结果：成功结果或明确的错误/中断结果。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Idempotency</div>
+        <h3>修复可以重复运行</h3>
+        <p><code>returned_ids</code> 会跳过已有结果；同一个修复算法再次执行时，不会为同一 call 追加第二条中断结果。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Auditability</div>
+        <h3>保留发生过的事实</h3>
+        <p>删除 assistant 消息会改写历史。追加错误结果保留“模型确实请求过工具，但执行被中断”的审计事实。</p>
+      </article>
+      <article class="phase">
+        <div class="label">Replayability</div>
+        <h3>恢复后仍可继续</h3>
+        <p>完整的 call/result 配对能形成确定的可重放历史，避免 provider 面对悬空请求，也让 durable session 明确知道该调用已经终止。</p>
+      </article>
+    </div>
+
+    <div class="card">
+      <h3>为什么在三个时机修复？</h3>
+      <ul>
+        <li><code>prompt_message()</code> 前：新用户输入进入历史前，先闭合旧调用。</li>
+        <li><code>continue_()</code> 前：恢复旧运行前，先建立完整上下文。</li>
+        <li><code>_run()</code> 的 <code>finally</code>：已观察到取消时，尽早补偿。</li>
+      </ul>
+      <p>入口前修复也覆盖了历史来自持久化存储、进程崩溃或旧版本状态，而不只是当前进程调用 <code>cancel()</code> 的情况。</p>
+    </div>
+  </section>
+
+  <section id="exercise">
+    <h2>10–14 分钟：找出应追加的消息</h2>
+    <div class="exercise">
+      <p>历史中有两个 assistant tool calls：</p>
+      <ul>
+        <li><code>call-A: read("README.md")</code>，已有成功的 <code>ToolResultMessage(tool_call_id="call-A")</code></li>
+        <li><code>call-B: deploy("production")</code>，没有任何 result，随后进程中断</li>
+      </ul>
+      <p>恢复时请回答三点：</p>
+      <ol>
+        <li>Tau 应追加几条消息？</li>
+        <li>新消息的 <code>tool_call_id</code> 和 <code>is_error</code> 分别是什么？</li>
+        <li>为什么绝不能默认重新执行 <code>call-B</code>？</li>
+      </ol>
+    </div>
+
+    <details>
+      <summary>回答后展开参考答案</summary>
+      <p>只追加一条消息：<code>ToolResultMessage(tool_call_id="call-B", is_error=True)</code>。<code>call-A</code> 已经闭合，重复追加会破坏一一对应关系。不能默认重试 <code>call-B</code>，因为崩溃点无法证明外部副作用是否已经发生；盲目重试可能重复部署。若平台要自动重试，必须另行设计幂等键、执行状态存储和工具级重试策略。</p>
+    </details>
+  </section>
+
+  <section id="recap">
+    <h2>14–15 分钟：一句话检索</h2>
+    <blockquote>孤儿 tool call 的修复不是 ______，而是追加一条通过 ______ 关联、标记为 ______ 的补偿结果，从而恢复消息历史的 ______。</blockquote>
+    <p>建议答案关键词：<strong>重试</strong>、<strong>tool_call_id</strong>、<strong>错误</strong>、<strong>完整性/可重放性</strong>。</p>
+  </section>
+
+  <section>
+    <h2>主来源</h2>
+    <p><a href="../src/tau_agent/harness.py"><code>src/tau_agent/harness.py:146–190, 219–244</code></a> 是修复算法与调用时机的主来源；<a href="../tests/test_agent_harness.py"><code>tests/test_agent_harness.py:202–213</code></a> 验证单个孤儿调用被补成错误结果；<a href="../tests/test_coding_session.py"><code>tests/test_coding_session.py:390–499</code></a> 验证从持久化会话加载时修复也会被保存。</p>
+  </section>
+
+  <section>
+    <h2>下一节</h2>
+    <p>Card 12 将把可靠性推进到工具安全：授权、取消、异常归一化和结果后处理分别应该放在哪一个 seam？</p>
+  </section>
+
+  <footer>遇到不清楚的地方，直接向教师追问。当前只讨论历史修复；自动重试与 exactly-once 副作用需要单独的执行协议。</footer>
+</main>
+</body>
+</html>
