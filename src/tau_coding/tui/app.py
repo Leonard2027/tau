@@ -24,6 +24,7 @@ from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.events import Key, Resize
 from textual.screen import ModalScreen
+from textual.strip import Strip
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
@@ -597,6 +598,17 @@ class PromptInput(TextArea):
             self.text = ""
             self.move_cursor((0, 0))
             self._clear_pending_paste()
+
+    def render_line(self, y: int) -> Strip:
+        """Render safely while a narrow terminal leaves no content width.
+
+        Textual's placeholder wrapping currently raises when the content width
+        is zero. This can happen briefly while a narrow terminal pane is
+        switching from the sidebar layout to compact mode.
+        """
+        if self.content_size.width <= 0:
+            return Strip.blank(0, self.visual_style.rich_style)
+        return super().render_line(y)
 
     def get_line(self, line_index: int) -> Text:
         """Retrieve one prompt line, coloring terminal commands like a running tool."""
@@ -2981,6 +2993,41 @@ class TauTuiApp(App[None]):
 
     #sidebar-content {
         height: auto;
+    }
+
+    #sidebar .sidebar-separator {
+        height: auto;
+    }
+
+    #sidebar .sidebar-resource-section {
+        width: 1fr;
+        height: auto;
+        padding: 0;
+        background: transparent;
+        border: none;
+    }
+
+    #sidebar .sidebar-resource-section:focus-within {
+        background-tint: transparent;
+    }
+
+    #sidebar .sidebar-resource-section CollapsibleTitle {
+        width: 1fr;
+        padding: 0 0 0 1;
+        color: $tau-prompt-text;
+        text-style: none;
+        background: transparent;
+    }
+
+    #sidebar .sidebar-resource-section CollapsibleTitle:hover,
+    #sidebar .sidebar-resource-section CollapsibleTitle:focus {
+        color: $tau-prompt-text;
+        text-style: none;
+        background: transparent;
+    }
+
+    #sidebar .sidebar-resource-section Contents {
+        padding: 1 0 0 1;
     }
 
     #sidebar-brand {

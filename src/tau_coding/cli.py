@@ -22,6 +22,7 @@ from tau_ai.env import (
 from tau_coding.catalog_loader import user_catalog_path
 from tau_coding.commands import format_reload_summary
 from tau_coding.credentials import FileCredentialStore
+from tau_coding.extension_installer import ExtensionInstallError, install_extension
 from tau_coding.extensions import StderrUiBridge
 from tau_coding.project_trust import TrustDefault, TrustOverride
 from tau_coding.provider_config import (
@@ -41,6 +42,7 @@ from tau_coding.provider_config import (
 from tau_coding.provider_runtime import create_model_provider
 from tau_coding.rendering import PrintOutputMode, create_event_renderer
 from tau_coding.resources import TauResourcePaths
+from tau_coding.rpc import RpcServer
 from tau_coding.session import (
     CodingSession,
     CodingSessionConfig,
@@ -91,6 +93,20 @@ _force_utf8_streams()
 app = typer.Typer(
     name="tau",
     help="Tau coding-agent harness.",
+    epilog="""Commands:
+
+  tau install SOURCE [--force] - Install a trusted local or Git extension.
+
+  tau update - Upgrade Tau.
+
+  tau sessions - List indexed sessions.
+
+  tau export REF [DEST] - Export a session as HTML or JSONL.
+
+  tau providers - List configured model providers.
+
+  tau setup - Configure an OpenAI-compatible provider.
+""",
     add_completion=False,
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
 )
@@ -99,6 +115,35 @@ app = typer.Typer(
 def providers_command() -> None:
     """List configured model providers."""
     render_provider_settings(load_provider_settings(), credential_reader=FileCredentialStore())
+
+
+def install_command(args: list[str]) -> None:
+    """Install an extension into Tau's user extension directory."""
+    source: str | None = None
+    force = False
+    for arg in args:
+        if arg == "--force":
+            force = True
+        elif arg.startswith("-"):
+            raise typer.BadParameter(f"Unknown option for `tau install`: {arg}")
+        elif source is None:
+            source = arg
+        else:
+            raise typer.BadParameter("Usage: tau install <source> [--force]")
+    if source is None:
+        raise typer.BadParameter("Usage: tau install <source> [--force]")
+
+    typer.echo(
+        "Warning: extensions execute arbitrary Python with your user permissions. "
+        "Only install sources you trust.",
+        err=True,
+    )
+    try:
+        destination = install_extension(source, force=force)
+    except ExtensionInstallError as exc:
+        typer.echo(f"Could not install extension: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"Installed {source} to {destination}")
 
 
 def setup_command(
@@ -202,8 +247,7 @@ def main(
         PrintOutputMode | None,
         typer.Option(
             "--mode",
-            help="Run in non-interactive print mode with this output format "
-            "(text, json, or transcript).",
+            help="Run headlessly with this output format (text, json, transcript, or rpc).",
         ),
     ] = None,
     output: Annotated[
@@ -350,7 +394,8 @@ def main(
     if extension_legacy is not None:
         raise typer.BadParameter("-x was renamed to -e/--extension.")
 
-    print_requested = print_mode or mode is not None
+    rpc_requested = mode is PrintOutputMode.rpc
+    print_requested = print_mode or (mode is not None and not rpc_requested)
     effective_output = mode or PrintOutputMode.text
 
     if session_id is not None:
@@ -365,29 +410,52 @@ def main(
     command = positional_args[0] if positional_args else None
     initial_prompt = " ".join(positional_args) if positional_args else None
 
-    if not print_requested and not export and command == "update":
+    if rpc_requested and export:
+        raise typer.BadParameter("--export cannot be combined with --mode rpc")
+
+    if not rpc_requested and not print_requested and not export and command == "update":
         if len(positional_args) != 1:
             raise typer.BadParameter("Usage: tau update")
         update_command()
         raise typer.Exit()
 
-    if not print_requested and not export and command == "sessions" and len(positional_args) == 1:
+    if not rpc_requested and not print_requested and not export and command == "install":
+        install_command(positional_args[1:])
+        raise typer.Exit()
+
+    if (
+        not rpc_requested
+        and not print_requested
+        and not export
+        and command == "sessions"
+        and len(positional_args) == 1
+    ):
         render_session_list(SessionManager().list_sessions())
         raise typer.Exit()
 
-    if not print_requested and not export and command == "export":
+    if not rpc_requested and not print_requested and not export and command == "export":
         _run_export_cli(positional_args[1:])
 
-    if export:
+    if export and not rpc_requested:
         if print_requested:
             raise typer.BadParameter("--export cannot be combined with --print/--mode.")
         _run_export_cli(positional_args)
 
-    if not print_requested and command == "providers" and len(positional_args) == 1:
+    if (
+        not rpc_requested
+        and not print_requested
+        and command == "providers"
+        and len(positional_args) == 1
+    ):
         providers_command()
         raise typer.Exit()
 
-    if not print_requested and command == "setup" and len(positional_args) == 1:
+    if (
+        not rpc_requested
+        and not print_requested
+        and command == "setup"
+        and len(positional_args) == 1
+    ):
         setup_command(
             provider_name=provider or DEFAULT_PROVIDER_NAME,
             base_url=setup_base_url,
@@ -407,6 +475,29 @@ def main(
         else None
     )
     resolved_append_system_prompt = _resolve_append_system_prompts(append_system_prompt or ())
+
+    if rpc_requested:
+        if initial_prompt is not None:
+            raise typer.BadParameter(
+                "RPC mode reads commands from stdin and does not accept a prompt"
+            )
+        try:
+            anyio.run(
+                run_openai_rpc_mode,
+                model,
+                cwd or Path.cwd(),
+                provider,
+                session,
+                extension_paths,
+                not no_extensions,
+                project_extensions,
+                custom_system_prompt,
+                resolved_append_system_prompt,
+                trust_override,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        raise typer.Exit()
 
     if not print_requested:
         notice = _startup_update_notice()
@@ -755,6 +846,83 @@ def _provider_credential_status(
     if environ.get(provider.api_key_env):
         return f"env:{provider.api_key_env}"
     return "missing"
+
+
+async def run_openai_rpc_mode(
+    model: str | None,
+    cwd: Path,
+    provider_name: str | None = None,
+    resume_session_id: str | None = None,
+    extension_paths: tuple[Path, ...] = (),
+    extensions_enabled: bool = True,
+    project_extensions_enabled: bool = False,
+    custom_system_prompt: str | None = None,
+    append_system_prompt: str | None = None,
+    trust_override: TrustOverride | None = None,
+) -> None:
+    """Run a persistent Pi-compatible JSONL RPC session."""
+    settings = load_provider_settings()
+    shell_settings = load_shell_settings()
+    manager = SessionManager()
+    record = _print_session_record(
+        manager,
+        resume_session_id=resume_session_id,
+        cwd=cwd,
+        settings=settings,
+        provider_name=provider_name,
+        model=model,
+        session_id=None,
+    )
+    explicit_selection = provider_name is not None or model is not None
+    selection = resolve_provider_selection(
+        settings,
+        provider_name=provider_name if explicit_selection else record.provider_name,
+        model=model if explicit_selection else record.model,
+    )
+    inference_provider = (
+        record.inference_provider
+        if resume_session_id is not None
+        and record.provider_name == "huggingface"
+        and selection.provider.name == "huggingface"
+        and record.model == selection.model
+        else selection.provider.inference_providers.get(selection.model)
+        if isinstance(selection.provider, OpenAICompatibleProviderConfig)
+        and selection.provider.name == "huggingface"
+        else None
+    )
+    provider = create_model_provider(
+        selection.provider,
+        model=selection.model,
+        inference_provider=inference_provider,
+        thinking_level=resolve_startup_thinking_level(selection.provider, selection.model),
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model=selection.model,
+            cwd=record.cwd,
+            storage=jsonl_session_storage(record.path),
+            session_id=record.id,
+            session_manager=manager,
+            provider_name=selection.provider.name,
+            inference_provider=inference_provider,
+            provider_settings=settings,
+            runtime_provider_config=selection.provider,
+            shell_command_prefix=shell_settings.shell_command_prefix,
+            extension_paths=extension_paths,
+            extensions_enabled=extensions_enabled,
+            project_extensions_enabled=project_extensions_enabled,
+            custom_system_prompt=custom_system_prompt,
+            append_system_prompt=append_system_prompt,
+            trust_override=trust_override,
+            trust_default=shell_settings.default_project_trust,
+        )
+    )
+    session.extension_runtime.set_ui_bridge(StderrUiBridge())
+    try:
+        await RpcServer(session).run()
+    finally:
+        await provider.aclose()
 
 
 async def run_openai_print_mode(
